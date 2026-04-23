@@ -120,6 +120,66 @@ class FormatterPreviewTest(unittest.TestCase):
         self.assertIn("State: `idle`", message)
         self.assertIn("Local Codex activity: `active`", message)
 
+    def test_format_status_shows_blocking_reason_and_recovery_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = GatewayState(Path(temp_dir) / "gateway_state.json")
+            state.finish_run(
+                LastRunSummary(
+                    run_id="run12345",
+                    requester_user_id=1,
+                    requester_name="tester",
+                    prompt_excerpt="prompt",
+                    started_at=datetime.now(timezone.utc),
+                    finished_at=datetime.now(timezone.utc),
+                    exit_code=None,
+                    exit_signal="BLOCKED",
+                    stdout_excerpt="",
+                    stderr_excerpt="approval required",
+                    assistant_response_excerpt="",
+                )
+            )
+
+            message = format_status(
+                state,
+                text_limit=700,
+                latest_response=None,
+                response_preview_chars=20,
+                blocking_reason="approval_required",
+                recovery_hint="Approve the pending action in the terminal.",
+            )
+
+        self.assertIn("approval_required", message)
+        self.assertIn("Approve the pending action", message)
+
+    def test_format_status_shows_bound_model_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = GatewayState(Path(temp_dir) / "gateway_state.json")
+            state.finish_run(
+                LastRunSummary(
+                    run_id="run12345",
+                    requester_user_id=1,
+                    requester_name="tester",
+                    prompt_excerpt="prompt",
+                    started_at=datetime.now(timezone.utc),
+                    finished_at=datetime.now(timezone.utc),
+                    exit_code=0,
+                    exit_signal=None,
+                    stdout_excerpt="",
+                    stderr_excerpt="",
+                    assistant_response_excerpt="ok",
+                )
+            )
+
+            message = format_status(
+                state,
+                text_limit=700,
+                latest_response=None,
+                response_preview_chars=20,
+                bound_model_profile="qwen3-8b",
+            )
+
+        self.assertIn("Bound model profile: `qwen3-8b`", message)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,7 +21,13 @@ class LastResponseStoreTest(unittest.TestCase):
             updated = refresh_last_response_file(target, latest)
 
             self.assertTrue(updated)
-            self.assertEqual(target.read_text(encoding="utf-8"), "full assistant response body")
+            self.assertTrue(
+                target.read_bytes().startswith(b"\xef\xbb\xbf")
+            )
+            self.assertEqual(
+                target.read_text(encoding="utf-8-sig"),
+                "full assistant response body",
+            )
 
 
 if __name__ == "__main__":
