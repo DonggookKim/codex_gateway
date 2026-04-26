@@ -27,7 +27,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
             codex_cwd=root,
             codex_home_parent=None,
             codex_home_seed_from=None,
-            codex_status_home=root,
+            codex_status_home=root / ".codex",
             prompt_max_chars=4000,
             status_text_max_chars=700,
             stream_tail_chars=2000,
@@ -80,11 +80,19 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         label: str = "triage",
         model_profile: str = "gpt-5.4",
     ) -> str:
-        store = SessionStore(root / "state", root / "runtime")
+        store = SessionStore(root / "state", root / "runtime", root / ".codex")
         session = store.create_session(
             project_id=project_id,
             label=label,
             model_profile=model_profile,
+            execution_env=(
+                "local_ollama"
+                if (
+                    model_profile == "qwen3-8b"
+                    or (":" in model_profile and not model_profile.startswith("gpt-"))
+                )
+                else "openai"
+            ),
         )
         return session.session_id
 
@@ -197,10 +205,28 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
             loaded = client.session_store.load_session("mail", selected_session_id)
             self.assertEqual(loaded.label, "Nightly triage")
             self.assertEqual(loaded.model_profile, "gpt-5.4")
+            self.assertEqual(loaded.execution_env, "openai")
             interaction.response.send_message.assert_awaited_once()
             sent_text = interaction.response.send_message.await_args.args[0]
             self.assertIn("Created and selected session", sent_text)
             self.assertIn("Nightly triage", sent_text)
+
+    async def test_session_new_assigns_local_execution_env_for_ollama_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._seed_project(root, allowed_model_profiles=["gpt-5.4", "llama3.1:latest"])
+            client = self._make_client(root)
+            client.state.select_project("mail")
+            client.state.select_model_profile_for_new_session("llama3.1:latest")
+            interaction = MagicMock()
+            interaction.response.send_message = AsyncMock()
+
+            await client._handle_session_new(interaction, "Local triage")
+
+            selected_session_id = client.state.selection_state["selected_session_id"]
+            self.assertIsNotNone(selected_session_id)
+            loaded = client.session_store.load_session("mail", selected_session_id)
+            self.assertEqual(loaded.execution_env, "local_ollama")
 
     async def test_model_select_updates_selected_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -218,8 +244,141 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
             "qwen3-8b",
         )
         interaction.response.send_message.assert_awaited_once()
+
+    async def test_tui_reports_attach_command_for_selected_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._seed_project(root)
+            session_id = self._seed_session(root, label="alerts")
+            client = self._make_client(root)
+            client.state.select_project("mail")
+            client.state.select_session(session_id)
+            client.session_store.update_codex_thread_ref(
+                "mail",
+                session_id,
+                "019thread-explicit",
+            )
+            session = client.session_store.load_session("mail", session_id)
+            sessions_dir = (
+                session.codex_home_path / "sessions" / "2026" / "04" / "24"
+            )
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            (sessions_dir / "rollout-2026-04-24T00-00-00-019thread-explicit.jsonl").write_text(
+                '{"type":"session_meta","payload":{"id":"019thread-explicit"}}\n',
+                encoding="utf-8",
+            )
+            interaction = MagicMock()
+            interaction.response.send_message = AsyncMock()
+
+            await client._handle_tui(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
         sent_text = interaction.response.send_message.await_args.args[0]
-        self.assertIn("qwen3-8b", sent_text)
+        self.assertIn("attach-gateway-session.sh", sent_text)
+        self.assertIn("mail", sent_text)
+        self.assertIn(session_id, sent_text)
+        self.assertIn("019thread-explicit", sent_text)
+
+    async def test_run_ask_recovers_from_missing_rollout_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._seed_project(root)
+            session_id = self._seed_session(root, label="alerts")
+            client = self._make_client(root)
+            client.session_store.update_codex_thread_ref(
+                "mail",
+                session_id,
+                "019stale-thread",
+            )
+
+            stale_summary = LastRunSummary(
+                run_id="run-stale",
+                requester_user_id=3,
+                requester_name="tester",
+                prompt_excerpt="hello",
+                started_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(timezone.utc),
+                exit_code=1,
+                exit_signal=None,
+                stdout_excerpt="",
+                stderr_excerpt="Error: thread/resume failed: no rollout found for thread id 019stale-thread",
+                assistant_response_excerpt="",
+                codex_thread_ref="019stale-thread",
+            )
+            fresh_summary = LastRunSummary(
+                run_id="run-fresh",
+                requester_user_id=3,
+                requester_name="tester",
+                prompt_excerpt="hello",
+                started_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(timezone.utc),
+                exit_code=0,
+                exit_signal=None,
+                stdout_excerpt="",
+                stderr_excerpt="",
+                assistant_response_excerpt="ok",
+                codex_thread_ref="019fresh-thread",
+            )
+
+            with patch(
+                "codex_gateway.bot.run_codex",
+                new=AsyncMock(side_effect=[stale_summary, fresh_summary]),
+            ) as run_codex_mock:
+                await client._run_ask(
+                    requester_id=3,
+                    requester_name="tester",
+                    prompt="hello",
+                    project_id="mail",
+                    session_id=session_id,
+                    codex_session_ref="019stale-thread",
+                    model_profile="gpt-5.4",
+                    project_label="Mail",
+                    session_label="alerts",
+                )
+
+            self.assertEqual(run_codex_mock.await_count, 2)
+            reloaded = client.session_store.load_session("mail", session_id)
+            self.assertEqual(reloaded.codex_thread_ref, "019fresh-thread")
+            self.assertEqual(
+                reloaded.last_run_summary["run_id"],
+                "run-fresh",
+            )
+
+    async def test_current_reports_selected_project_session_and_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._seed_project(root, label="Mail")
+            session_id = self._seed_session(root, label="alerts", model_profile="qwen3-8b")
+            client = self._make_client(root)
+            client.state.select_project("mail")
+            client.state.select_session(session_id)
+            client.state.enable_watch(
+                "mail",
+                session_id,
+                run_id="run-1",
+                interval_seconds=30.0,
+            )
+            client.session_store.update_codex_thread_ref(
+                "mail",
+                session_id,
+                "019thread-explicit",
+            )
+            interaction = MagicMock()
+            interaction.response.send_message = AsyncMock()
+
+            await client._handle_current(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        sent_text = interaction.response.send_message.await_args.args[0]
+        self.assertIn("Current selection", sent_text)
+        self.assertIn("Project: `mail`", sent_text)
+        self.assertIn("Session: `", sent_text)
+        self.assertIn("alerts", sent_text)
+        self.assertIn("Model: `qwen3-8b`", sent_text)
+        self.assertIn("Execution env: `local_ollama`", sent_text)
+        self.assertIn("Watch: `on`", sent_text)
+        self.assertIn("30s", sent_text)
+        self.assertIn("019thread-explicit", sent_text)
 
     async def test_watch_on_tracks_selected_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -266,6 +425,28 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             client.state.selection_state["watch_interval_seconds"],
             "30.0",
+        )
+
+    async def test_model_select_accepts_discovered_ollama_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._seed_project(root, allowed_model_profiles=["gpt-5.4"])
+            client = self._make_client(root)
+            client.config = GatewayConfig(
+                **{
+                    **client.config.__dict__,
+                    "discovered_ollama_models": ("qwen3:8b", "llama3.1:latest"),
+                }
+            )
+            client.state.select_project("mail")
+            interaction = MagicMock()
+            interaction.response.send_message = AsyncMock()
+
+            await client._handle_model_select(interaction, "llama3.1:latest")
+
+        self.assertEqual(
+            client.state.selection_state["selected_model_profile_for_new_session"],
+            "llama3.1:latest",
         )
 
     async def test_project_select_turns_watch_off_when_project_changes(self) -> None:
@@ -323,6 +504,10 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
             store = SessionStore(root / "state", root / "runtime")
             session = store.load_session("mail", session_id)
             session.last_response_path.write_text("done", encoding="utf-8-sig")
+            session.last_response_path.with_name("last_stderr.txt").write_text(
+                "warn",
+                encoding="utf-8-sig",
+            )
             store.update_last_run_summary(
                 "mail",
                 session_id,
@@ -358,6 +543,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Watch complete", kwargs["content"])
         self.assertIn("mail", kwargs["content"])
         self.assertEqual(len(kwargs["files"]), 1)
+        self.assertEqual(kwargs["files"][0].filename, "last_response.txt")
         self.assertEqual(
             client.state.selection_state["watched_project_id"],
             "mail",
@@ -447,6 +633,37 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         kwargs = channel.send.await_args.kwargs
         self.assertIn("Watch snapshot", kwargs["content"])
         self.assertIn("Bound model profile: `qwen3-8b`", kwargs["content"])
+
+    async def test_persist_session_artifacts_copies_debug_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._seed_project(root)
+            session_id = self._seed_session(root)
+            client = self._make_client(root)
+            store = SessionStore(root / "state", root / "runtime")
+            session = store.load_session("mail", session_id)
+            debug_path = session.runtime_root / "tmp" / "run-1-debug.json"
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            debug_path.write_text('{"argv":["codex"]}', encoding="utf-8")
+
+            summary = LastRunSummary(
+                run_id="run-1",
+                requester_user_id=3,
+                requester_name="tester",
+                prompt_excerpt="hello",
+                started_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(timezone.utc),
+                exit_code=0,
+                exit_signal=None,
+                stdout_excerpt="",
+                stderr_excerpt="",
+                assistant_response_excerpt="ok",
+            )
+
+            client._persist_session_artifacts(session, "run-1", summary)
+
+            copied = session.last_response_path.with_name("last_debug.json")
+            self.assertTrue(copied.exists())
 
     async def test_run_watch_timer_repeats_until_idle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

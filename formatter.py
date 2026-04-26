@@ -63,6 +63,10 @@ def format_status(
     latest_response: LatestCodexResponse | None = None,
     response_preview_chars: int = 20,
     external_codex_activity: bool = False,
+    blocking_reason: str | None = None,
+    recovery_hint: str | None = None,
+    bound_model_profile: str | None = None,
+    bound_execution_env: str | None = None,
 ) -> str:
     local_activity_line = (
         "Local Codex activity: "
@@ -80,6 +84,10 @@ def format_status(
             f"Elapsed: `{_fmt_elapsed(active.started_at)}`",
             f"Current request: {inline_excerpt(active.prompt_excerpt, text_limit)}",
         ]
+        if bound_model_profile:
+            lines.append(f"Bound model profile: `{bound_model_profile}`")
+        if bound_execution_env:
+            lines.append(f"Execution env: `{bound_execution_env}`")
         if latest_response is not None and latest_response.text.strip():
             lines.append(
                 "Last Codex response: "
@@ -90,17 +98,24 @@ def format_status(
                 "Recent stderr: "
                 + inline_excerpt(active.stderr_tail, text_limit)
             )
+        if blocking_reason:
+            lines.append(f"Blocking reason: `{blocking_reason}`")
+        if recovery_hint:
+            lines.append("Recovery hint: " + inline_excerpt(recovery_hint, text_limit))
         return limit_discord_message("\n".join(lines))
 
     last_run = state.last_run
     if last_run is None:
-        return "\n".join(
-            [
-                "State: `idle`",
-                local_activity_line,
-                "No previous gateway-managed run recorded yet.",
-            ]
-        )
+        lines = [
+            "State: `idle`",
+            local_activity_line,
+        ]
+        if bound_model_profile:
+            lines.append(f"Bound model profile: `{bound_model_profile}`")
+        if bound_execution_env:
+            lines.append(f"Execution env: `{bound_execution_env}`")
+        lines.append("No previous gateway-managed run recorded yet.")
+        return "\n".join(lines)
 
     lines = [
         f"State: `{RunMode.IDLE.value}`",
@@ -110,6 +125,10 @@ def format_status(
         f"Started: `{_fmt_time(last_run.started_at)}`",
         f"Finished: `{_fmt_time(last_run.finished_at)}`",
     ]
+    if bound_model_profile:
+        lines.append(f"Bound model profile: `{bound_model_profile}`")
+    if bound_execution_env:
+        lines.append(f"Execution env: `{bound_execution_env}`")
     if latest_response is not None and latest_response.text.strip():
         lines.append(f"Last Codex session: `{latest_response.session_id}`")
         lines.append(
@@ -128,6 +147,10 @@ def format_status(
         lines.append(f"Exit signal: `{last_run.exit_signal}`")
     else:
         lines.append(f"Exit code: `{last_run.exit_code}`")
+    if blocking_reason:
+        lines.append(f"Blocking reason: `{blocking_reason}`")
+    if recovery_hint:
+        lines.append("Recovery hint: " + inline_excerpt(recovery_hint, text_limit))
     if last_run.stderr_excerpt.strip() and (
         last_run.exit_code not in (0, None) or not last_run.assistant_response_excerpt.strip()
     ):

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 import unittest
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from codex_gateway.config import GatewayConfig
-from codex_gateway.runner import _prepare_runtime_home, build_command, run_codex
+from codex_gateway.runner import (
+    _prepare_runtime_home,
+    build_command,
+    prepare_runtime_home_dir,
+    run_codex,
+)
 from codex_gateway.state import GatewayState
 
 
@@ -58,10 +65,27 @@ class RunnerCommandTest(unittest.TestCase):
             model_profile="qwen3-8b",
         )
 
-        self.assertIn("--profile", command)
+        self.assertIn("-p", command)
         self.assertIn("ollama-qwen25-coder", command)
         self.assertIn("-m", command)
         self.assertIn("qwen3:8b", command)
+        self.assertLess(command.index("-p"), command.index("resume"))
+
+    def test_build_command_uses_local_profile_for_discovered_ollama_model(self) -> None:
+        command = build_command(
+            codex_bin="codex",
+            session_ref="session-123",
+            prompt="hello",
+            last_message_path=Path("/tmp/last.txt"),
+            model_profile="llama3.1:latest",
+            local_model_profiles={"qwen3:8b", "llama3.1:latest"},
+        )
+
+        self.assertIn("-p", command)
+        self.assertIn("ollama-qwen25-coder", command)
+        self.assertIn("-m", command)
+        self.assertIn("llama3.1:latest", command)
+        self.assertLess(command.index("-p"), command.index("resume"))
 
     def test_prepare_runtime_home_preserves_existing_codex_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -102,6 +126,77 @@ class RunnerCommandTest(unittest.TestCase):
             env = _prepare_runtime_home(config)
             self.assertEqual(env, {"HOME": str(home_parent)})
             self.assertTrue(marker.exists())
+
+    def test_prepare_runtime_home_links_shared_auth_instead_of_copying_seed_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            home_parent = root / "runtime-home"
+            seed_root = root / "seed-home"
+            seed_codex_dir = seed_root / ".codex"
+            seed_codex_dir.mkdir(parents=True, exist_ok=True)
+            (seed_codex_dir / "config.toml").write_text("model = 'gpt-5.4'\n", encoding="utf-8")
+            (seed_codex_dir / "auth.json").write_text('{"stale":true}\n', encoding="utf-8")
+
+            shared_auth = root / "global-home" / ".codex" / "auth.json"
+            shared_auth.parent.mkdir(parents=True, exist_ok=True)
+            shared_auth.write_text('{"fresh":true}\n', encoding="utf-8")
+
+            config = GatewayConfig(
+                discord_gateway_token="token",
+                control_guild_id=1,
+                control_channel_id=2,
+                allowed_user_ids={3},
+                codex_bin="codex",
+                codex_cwd=root,
+                codex_home_parent=home_parent,
+                codex_home_seed_from=seed_codex_dir,
+                codex_status_home=root,
+                prompt_max_chars=4000,
+                status_text_max_chars=700,
+                stream_tail_chars=2000,
+                stop_sigint_grace_seconds=5.0,
+                stop_sigterm_grace_seconds=5.0,
+                response_preview_chars=20,
+                state_file=root / "state.json",
+                tmp_dir=root / "tmp",
+                last_response_file=root / "tmp" / "last_response.txt",
+                prompt_preamble="test",
+            )
+
+            with patch.dict(os.environ, {"CODEX_SHARED_AUTH_SOURCE": str(shared_auth)}):
+                env = _prepare_runtime_home(config)
+
+            target_auth = home_parent / ".codex" / "auth.json"
+            self.assertEqual(env, {"HOME": str(home_parent)})
+            self.assertTrue(target_auth.is_symlink())
+            self.assertEqual(target_auth.resolve(), shared_auth.resolve())
+            self.assertEqual(target_auth.read_text(encoding="utf-8"), '{"fresh":true}\n')
+
+    def test_prepare_runtime_home_removes_auth_for_local_execution_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            home_parent = root / "runtime-home"
+            seed_root = root / "seed-home"
+            seed_codex_dir = seed_root / ".codex"
+            seed_codex_dir.mkdir(parents=True, exist_ok=True)
+            (seed_codex_dir / "config.toml").write_text(
+                "model = 'qwen3:8b'\n",
+                encoding="utf-8",
+            )
+            (seed_codex_dir / "auth.json").write_text(
+                '{"stale":true}\n',
+                encoding="utf-8",
+            )
+
+            prepare_runtime_home_dir(
+                home_parent=home_parent,
+                seed_from=seed_codex_dir,
+                shared_auth_source=None,
+                use_shared_auth=False,
+            )
+
+            target_auth = home_parent / ".codex" / "auth.json"
+            self.assertFalse(target_auth.exists())
 
 
 class RunnerSessionRefTest(unittest.IsolatedAsyncioTestCase):
@@ -198,7 +293,7 @@ class RunnerSessionRefTest(unittest.IsolatedAsyncioTestCase):
             ) as build_command_mock, patch(
                 "codex_gateway.runner.asyncio.create_subprocess_exec",
                 new=AsyncMock(return_value=fake_process),
-            ):
+            ) as create_subprocess_exec_mock:
                 await run_codex(
                     state=state,
                     config=config,
@@ -210,6 +305,10 @@ class RunnerSessionRefTest(unittest.IsolatedAsyncioTestCase):
                 )
 
         build_command_mock.assert_called_once()
+        self.assertEqual(
+            create_subprocess_exec_mock.await_args.kwargs["stdin"],
+            asyncio.subprocess.DEVNULL,
+        )
         self.assertEqual(
             build_command_mock.call_args.args[1],
             "session-123",
@@ -268,6 +367,124 @@ class RunnerSessionRefTest(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(summary.codex_thread_ref, "019newthread")
+
+    async def test_run_codex_captures_thread_started_ref_for_new_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = GatewayConfig(
+                discord_gateway_token="token",
+                control_guild_id=1,
+                control_channel_id=2,
+                allowed_user_ids={3},
+                codex_bin="codex",
+                codex_cwd=root,
+                codex_home_parent=None,
+                codex_home_seed_from=None,
+                codex_status_home=root,
+                prompt_max_chars=4000,
+                status_text_max_chars=700,
+                stream_tail_chars=2000,
+                stop_sigint_grace_seconds=5.0,
+                stop_sigterm_grace_seconds=5.0,
+                response_preview_chars=20,
+                state_file=root / "state.json",
+                tmp_dir=root / "tmp",
+                last_response_file=root / "tmp" / "last_response.txt",
+                prompt_preamble="test",
+            )
+            state = GatewayState(config.state_file)
+            stdout = asyncio.StreamReader()
+            stdout.feed_data(
+                b'{"type":"thread.started","thread_id":"019threadstarted"}\n'
+            )
+            stdout.feed_eof()
+            stderr = asyncio.StreamReader()
+            stderr.feed_eof()
+
+            fake_process = MagicMock()
+            fake_process.pid = 4321
+            fake_process.stdout = stdout
+            fake_process.stderr = stderr
+            fake_process.wait = AsyncMock(return_value=0)
+
+            with patch(
+                "codex_gateway.runner.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=fake_process),
+            ):
+                summary = await run_codex(
+                    state=state,
+                    config=config,
+                    requester_user_id=3,
+                    requester_name="tester",
+                    prompt="hello",
+                    start_new_session=True,
+                )
+
+        self.assertEqual(summary.codex_thread_ref, "019threadstarted")
+
+    async def test_run_codex_writes_debug_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = GatewayConfig(
+                discord_gateway_token="token",
+                control_guild_id=1,
+                control_channel_id=2,
+                allowed_user_ids={3},
+                codex_bin="codex",
+                codex_cwd=root,
+                codex_home_parent=None,
+                codex_home_seed_from=None,
+                codex_status_home=root,
+                prompt_max_chars=4000,
+                status_text_max_chars=700,
+                stream_tail_chars=2000,
+                stop_sigint_grace_seconds=5.0,
+                stop_sigterm_grace_seconds=5.0,
+                response_preview_chars=20,
+                state_file=root / "state.json",
+                tmp_dir=root / "tmp",
+                last_response_file=root / "tmp" / "last_response.txt",
+                prompt_preamble="test",
+            )
+            state = GatewayState(config.state_file)
+            state.select_session("session-123")
+
+            stdout = asyncio.StreamReader()
+            stdout.feed_eof()
+            stderr = asyncio.StreamReader()
+            stderr.feed_eof()
+
+            fake_process = MagicMock()
+            fake_process.pid = 4321
+            fake_process.stdout = stdout
+            fake_process.stderr = stderr
+            fake_process.wait = AsyncMock(return_value=0)
+
+            with patch(
+                "codex_gateway.runner.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=fake_process),
+            ):
+                summary = await run_codex(
+                    state=state,
+                    config=config,
+                    requester_user_id=3,
+                    requester_name="tester",
+                    prompt="hello",
+                    project_id="mail",
+                    session_id="abc123",
+                    session_ref="session-123",
+                    start_new_session=False,
+                    model_profile="gpt-5.4",
+                )
+
+            debug_path = config.tmp_dir / f"{summary.run_id}-debug.json"
+            payload = json.loads(debug_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["session_ref"], "session-123")
+        self.assertEqual(payload["project_id"], "mail")
+        self.assertEqual(payload["session_id"], "abc123")
+        self.assertEqual(payload["model_profile"], "gpt-5.4")
+        self.assertEqual(payload["exit_code"], 0)
 
 
 if __name__ == "__main__":

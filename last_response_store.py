@@ -10,7 +10,8 @@ def write_last_response_text(target: Path, text: str) -> bool:
     if not normalized:
         return False
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(normalized, encoding="utf-8")
+    # Use a UTF-8 BOM so Discord-downloaded text opens cleanly in mobile viewers.
+    target.write_text(normalized, encoding="utf-8-sig")
     return True
 
 

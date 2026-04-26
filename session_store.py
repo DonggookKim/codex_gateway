@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+from .execution_env import infer_execution_env
 
 
 def utc_now() -> str:
@@ -18,6 +21,7 @@ class SessionRecord:
     project_id: str
     label: str
     model_profile: str
+    execution_env: str
     status: str
     codex_home_path: Path
     runtime_root: Path
@@ -50,6 +54,12 @@ class SessionRecord:
             project_id=str(payload.get("project_id", "")),
             label=str(payload.get("label", "")),
             model_profile=str(payload.get("model_profile", "")),
+            execution_env=str(
+                payload.get(
+                    "execution_env",
+                    infer_execution_env(str(payload.get("model_profile", ""))),
+                )
+            ),
             status=str(payload.get("status", "idle")),
             codex_home_path=Path(str(payload.get("codex_home_path", ""))),
             runtime_root=Path(str(payload.get("runtime_root", ""))),
@@ -113,15 +123,20 @@ class SessionStore:
         self,
         state_root: Path,
         runtime_root: Path | None = None,
+        gateway_codex_home: Path | None = None,
     ) -> None:
         self.state_root = state_root
-        self.runtime_root = runtime_root or (Path("/tmp") / "codex_gateway_runtime")
+        self.runtime_root = runtime_root or (
+            Path.home() / "codex_gateway_runtime"
+        )
+        self.gateway_codex_home = gateway_codex_home
 
     def create_session(
         self,
         project_id: str,
         label: str,
         model_profile: str,
+        execution_env: str | None = None,
     ) -> SessionRecord:
         session_id = uuid.uuid4().hex[:8]
         record = self._build_session_record(
@@ -129,6 +144,7 @@ class SessionStore:
             session_id=session_id,
             label=label,
             model_profile=model_profile,
+            execution_env=execution_env or infer_execution_env(model_profile),
             codex_thread_ref=None,
         )
         self._write_record(record)
@@ -141,13 +157,15 @@ class SessionStore:
         session_id: str,
         label: str,
         model_profile: str,
-        codex_thread_ref: str | None,
+        execution_env: str | None = None,
+        codex_thread_ref: str | None = None,
     ) -> SessionRecord:
         record = self._build_session_record(
             project_id=project_id,
             session_id=session_id,
             label=label,
             model_profile=model_profile,
+            execution_env=execution_env or infer_execution_env(model_profile),
             codex_thread_ref=codex_thread_ref,
         )
         self._write_record(record)
@@ -206,6 +224,7 @@ class SessionStore:
             project_id=record.project_id,
             label=record.label,
             model_profile=record.model_profile,
+            execution_env=record.execution_env,
             status="blocked",
             codex_home_path=record.codex_home_path,
             runtime_root=record.runtime_root,
@@ -285,6 +304,7 @@ class SessionStore:
         session_id: str,
         label: str,
         model_profile: str,
+        execution_env: str,
         codex_thread_ref: str | None,
     ) -> SessionRecord:
         session_root = self._session_root(project_id, session_id)
@@ -293,7 +313,7 @@ class SessionStore:
             self.runtime_root / "projects" / project_id / "sessions" / session_id
         )
         last_response_path = session_root / "artifacts" / "last_response.txt"
-        codex_home_path.parent.mkdir(parents=True, exist_ok=True)
+        codex_home_path.mkdir(parents=True, exist_ok=True)
         runtime_root.mkdir(parents=True, exist_ok=True)
         last_response_path.parent.mkdir(parents=True, exist_ok=True)
         return SessionRecord(
@@ -301,6 +321,7 @@ class SessionStore:
             project_id=project_id,
             label=label,
             model_profile=model_profile,
+            execution_env=execution_env,
             status="idle",
             codex_home_path=codex_home_path,
             runtime_root=runtime_root,
@@ -335,3 +356,77 @@ class SessionStore:
 
     def _record_path(self, project_id: str, session_id: str) -> Path:
         return self._session_root(project_id, session_id) / "session.json"
+
+    def _expected_codex_home_path(
+        self,
+        project_id: str,
+        session_id: str,
+    ) -> Path:
+        return self._session_root(project_id, session_id) / "codex-home" / ".codex"
+
+    def materialize_session_codex_home(self, record: SessionRecord) -> SessionRecord:
+        expected_codex_home = self._expected_codex_home_path(
+            record.project_id,
+            record.session_id,
+        )
+        if record.codex_home_path == expected_codex_home:
+            return record
+
+        if record.codex_home_path.exists():
+            self._copy_legacy_session_rollouts(
+                source_codex_home=record.codex_home_path,
+                target_codex_home=expected_codex_home,
+                thread_ref=record.codex_thread_ref,
+            )
+
+        updated_record = SessionRecord(
+            **{
+                **record.__dict__,
+                "codex_home_path": expected_codex_home,
+            }
+        )
+        self._write_record(updated_record)
+        return updated_record
+
+    def _copy_legacy_session_rollouts(
+        self,
+        *,
+        source_codex_home: Path,
+        target_codex_home: Path,
+        thread_ref: str | None,
+    ) -> None:
+        source_sessions = source_codex_home / "sessions"
+        if not source_sessions.exists():
+            return
+
+        target_codex_home.mkdir(parents=True, exist_ok=True)
+        copied_any = False
+        for source_file in source_sessions.rglob("*.jsonl"):
+            if not self._should_copy_rollout_file(source_file, thread_ref):
+                continue
+            relative_path = source_file.relative_to(source_codex_home)
+            target_file = target_codex_home / relative_path
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_file, target_file)
+            copied_any = True
+
+        if not copied_any:
+            sessions_dir = target_codex_home / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    def _should_copy_rollout_file(
+        self,
+        source_file: Path,
+        thread_ref: str | None,
+    ) -> bool:
+        if not thread_ref:
+            return False
+        if thread_ref in source_file.name:
+            return True
+        try:
+            return thread_ref in source_file.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            return False
