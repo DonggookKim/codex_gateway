@@ -15,7 +15,9 @@ from codex_gateway.direct_runner import (
     _truncate_result,
     _extract_tool_calls_from_text,
     _execute_builtin_tool,
+    run_direct_ollama,
 )
+from codex_gateway.state import GatewayState, LastRunSummary
 
 
 class BuiltinToolDefinitionsTest(unittest.TestCase):
@@ -159,3 +161,132 @@ class ExecuteBuiltinToolTest(unittest.TestCase):
             )
             self.assertIn("a.py", result)
             self.assertIn("b.txt", result)
+
+
+class AgentLoopTest(unittest.TestCase):
+    def _make_config(self, tmp_dir: str) -> MagicMock:
+        config = MagicMock()
+        config.codex_cwd = Path(tmp_dir)
+        config.ollama_host = "http://localhost:11434"
+        config.direct_max_iterations = 3
+        config.direct_context_chars = 90000
+        config.direct_shell_timeout = 10
+        config.direct_tool_result_max_chars = 8000
+        config.direct_system_prompt = "You are a coding assistant."
+        config.status_text_max_chars = 700
+        config.state_root = Path(tmp_dir) / "state"
+        config.state_root.mkdir(parents=True, exist_ok=True)
+        return config
+
+    @patch("codex_gateway.direct_runner.ollama.AsyncClient")
+    def test_simple_text_response(self, mock_client_cls) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._make_config(tmp)
+            state_file = Path(tmp) / "state" / "gateway_state.json"
+            state = GatewayState(state_file)
+
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+            mock_response = MagicMock()
+            mock_response.message = MagicMock()
+            mock_response.message.content = "Hello! I'm here to help."
+            mock_response.message.tool_calls = None
+            mock_client.chat = AsyncMock(return_value=mock_response)
+
+            summary = asyncio.get_event_loop().run_until_complete(
+                run_direct_ollama(
+                    state=state,
+                    config=config,
+                    requester_user_id=123,
+                    requester_name="testuser",
+                    prompt="hello",
+                    model_profile="qwen3:8b",
+                )
+            )
+
+            self.assertIsInstance(summary, LastRunSummary)
+            self.assertEqual(summary.exit_code, 0)
+            self.assertIn("Hello", summary.assistant_response_excerpt)
+
+    @patch("codex_gateway.direct_runner.ollama.AsyncClient")
+    def test_tool_call_then_text_response(self, mock_client_cls) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._make_config(tmp)
+            state_file = Path(tmp) / "state" / "gateway_state.json"
+            state = GatewayState(state_file)
+
+            # Create a file for the shell tool to find
+            (Path(tmp) / "test.py").write_text("print('hi')", encoding="utf-8")
+
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+
+            # First call: model requests a tool call
+            tool_response = MagicMock()
+            tool_response.message = MagicMock()
+            tool_response.message.content = ""
+            tool_call = MagicMock()
+            tool_call.function = MagicMock()
+            tool_call.function.name = "shell"
+            tool_call.function.arguments = {"command": "ls"}
+            tool_response.message.tool_calls = [tool_call]
+
+            # Second call: model returns text
+            text_response = MagicMock()
+            text_response.message = MagicMock()
+            text_response.message.content = "Found test.py in the directory."
+            text_response.message.tool_calls = None
+
+            mock_client.chat = AsyncMock(side_effect=[tool_response, text_response])
+
+            summary = asyncio.get_event_loop().run_until_complete(
+                run_direct_ollama(
+                    state=state,
+                    config=config,
+                    requester_user_id=123,
+                    requester_name="testuser",
+                    prompt="list files",
+                    model_profile="qwen3:8b",
+                )
+            )
+
+            self.assertEqual(summary.exit_code, 0)
+            self.assertEqual(mock_client.chat.await_count, 2)
+
+    @patch("codex_gateway.direct_runner.ollama.AsyncClient")
+    def test_max_iterations_stops_loop(self, mock_client_cls) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._make_config(tmp)
+            config.direct_max_iterations = 2
+            state_file = Path(tmp) / "state" / "gateway_state.json"
+            state = GatewayState(state_file)
+
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+
+            # Model always requests tool calls
+            tool_response = MagicMock()
+            tool_response.message = MagicMock()
+            tool_response.message.content = "Let me check..."
+            tool_call = MagicMock()
+            tool_call.function = MagicMock()
+            tool_call.function.name = "shell"
+            tool_call.function.arguments = {"command": "echo hi"}
+            tool_response.message.tool_calls = [tool_call]
+
+            mock_client.chat = AsyncMock(return_value=tool_response)
+
+            summary = asyncio.get_event_loop().run_until_complete(
+                run_direct_ollama(
+                    state=state,
+                    config=config,
+                    requester_user_id=123,
+                    requester_name="testuser",
+                    prompt="loop test",
+                    model_profile="qwen3:8b",
+                )
+            )
+
+            self.assertEqual(summary.exit_code, 0)
+            # Should have called chat exactly max_iterations times
+            self.assertEqual(mock_client.chat.await_count, 2)
