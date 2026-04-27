@@ -8,10 +8,9 @@ from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
-# Built-in tool names that may collide with MCP server tool names.
-# NOTE: When Task 4 creates direct_runner.py with its own BUILTIN_TOOL_NAMES,
-# Task 5 will consolidate them. For now this is the authoritative definition.
-BUILTIN_TOOL_NAMES = {"shell", "read_file", "write_file", "edit_file", "list_files"}
+BUILTIN_TOOL_NAMES = frozenset(
+    {"shell", "read_file", "write_file", "edit_file", "list_files"}
+)
 
 MCP_TOOL_CALL_TIMEOUT = 30
 
