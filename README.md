@@ -61,6 +61,9 @@ Execution isolation is session-scoped:
   implementation plan used for the current rollout
 - [DESIGN.md](./DESIGN.md): multi-project architecture, command contracts, and
   persisted state model.
+- [docs/direct-ollama-orchestration.md](./docs/direct-ollama-orchestration.md):
+  direct Ollama tool orchestration path used by `local_ollama` sessions
+  (bypasses Codex CLI, manages its own tools and MCP connections).
 
 ## Configuration
 

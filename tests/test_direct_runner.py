@@ -58,6 +58,12 @@ class DangerousCommandTest(unittest.TestCase):
     def test_allows_rm_in_subdirectory(self) -> None:
         self.assertFalse(_is_dangerous_command("rm -rf ./build"))
 
+    def test_blocks_chmod_777_root(self) -> None:
+        self.assertTrue(_is_dangerous_command("chmod 777 /"))
+
+    def test_blocks_fork_bomb(self) -> None:
+        self.assertTrue(_is_dangerous_command(":(){ :|:& };:"))
+
 
 class TruncateResultTest(unittest.TestCase):
     def test_truncates_long_output(self) -> None:
@@ -407,3 +413,135 @@ class EndToEndSmokeTest(unittest.TestCase):
 
             self.assertEqual(summary.exit_signal, "SPAWN_FAILED")
             self.assertIn("Ollama not running", summary.stderr_excerpt)
+
+
+class PathTraversalProtectionTest(unittest.TestCase):
+    """Verify file tools refuse paths that escape the working directory."""
+
+    def test_read_file_blocks_parent_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as outer, tempfile.TemporaryDirectory() as cwd:
+            secret = Path(outer) / "secret.txt"
+            secret.write_text("top secret", encoding="utf-8")
+            result = asyncio.get_event_loop().run_until_complete(
+                _execute_builtin_tool(
+                    "read_file",
+                    {"path": f"../{Path(outer).name}/secret.txt"},
+                    Path(cwd), 120, 8000,
+                )
+            )
+            self.assertIn("escapes working directory", result)
+
+    def test_write_file_blocks_parent_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as outer, tempfile.TemporaryDirectory() as cwd:
+            target = Path(outer) / "evil.txt"
+            result = asyncio.get_event_loop().run_until_complete(
+                _execute_builtin_tool(
+                    "write_file",
+                    {"path": f"../{Path(outer).name}/evil.txt", "content": "x"},
+                    Path(cwd), 120, 8000,
+                )
+            )
+            self.assertIn("escapes working directory", result)
+            self.assertFalse(target.exists())
+
+    def test_edit_file_blocks_parent_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as outer, tempfile.TemporaryDirectory() as cwd:
+            target = Path(outer) / "f.txt"
+            target.write_text("original", encoding="utf-8")
+            result = asyncio.get_event_loop().run_until_complete(
+                _execute_builtin_tool(
+                    "edit_file",
+                    {
+                        "path": f"../{Path(outer).name}/f.txt",
+                        "old_text": "original",
+                        "new_text": "owned",
+                    },
+                    Path(cwd), 120, 8000,
+                )
+            )
+            self.assertIn("escapes working directory", result)
+            self.assertEqual(target.read_text(encoding="utf-8"), "original")
+
+    def test_list_files_blocks_parent_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as outer, tempfile.TemporaryDirectory() as cwd:
+            result = asyncio.get_event_loop().run_until_complete(
+                _execute_builtin_tool(
+                    "list_files",
+                    {"path": f"../{Path(outer).name}"},
+                    Path(cwd), 120, 8000,
+                )
+            )
+            self.assertIn("escapes working directory", result)
+
+
+class ShellTimeoutTest(unittest.TestCase):
+    def test_timed_out_command_is_killed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = asyncio.get_event_loop().run_until_complete(
+                _execute_builtin_tool(
+                    "shell",
+                    {"command": "sleep 5"},
+                    cwd, 1, 8000,
+                )
+            )
+            self.assertIn("timed out", result)
+
+
+class TextEmbeddedToolCallExtractionTest(unittest.TestCase):
+    """When an 8B model emits a tool call as text, the loop should still execute it."""
+
+    @patch("codex_gateway.direct_runner.ollama.AsyncClient")
+    def test_extracts_and_executes_text_embedded_tool_call(
+        self, mock_client_cls,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "demo.txt").write_text("alive", encoding="utf-8")
+
+            config = MagicMock()
+            config.codex_cwd = cwd
+            config.ollama_host = "http://localhost:11434"
+            config.direct_max_iterations = 3
+            config.direct_context_chars = 90000
+            config.direct_shell_timeout = 10
+            config.direct_tool_result_max_chars = 8000
+            config.direct_system_prompt = "system"
+            config.status_text_max_chars = 700
+            config.state_root = cwd / "state"
+            config.state_root.mkdir()
+            config.last_response_file = cwd / "last.txt"
+
+            state = GatewayState(cwd / "state" / "gw.json")
+
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+
+            text_tool_call = MagicMock()
+            text_tool_call.message = MagicMock()
+            text_tool_call.message.content = (
+                'Let me check: {"name": "read_file", "arguments": {"path": "demo.txt"}}'
+            )
+            text_tool_call.message.tool_calls = None
+
+            final = MagicMock()
+            final.message = MagicMock()
+            final.message.content = "The file says: alive"
+            final.message.tool_calls = None
+
+            mock_client.chat = AsyncMock(side_effect=[text_tool_call, final])
+
+            summary = asyncio.get_event_loop().run_until_complete(
+                run_direct_ollama(
+                    state=state,
+                    config=config,
+                    requester_user_id=1,
+                    requester_name="x",
+                    prompt="check demo",
+                    model_profile="qwen3:8b",
+                )
+            )
+
+            self.assertEqual(summary.exit_code, 0)
+            self.assertEqual(mock_client.chat.await_count, 2)
+            self.assertIn("alive", summary.assistant_response_excerpt)

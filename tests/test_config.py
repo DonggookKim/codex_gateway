@@ -56,3 +56,58 @@ class DirectModeConfigDefaultsTest(unittest.TestCase):
         self.assertEqual(DEFAULT_DIRECT_SHELL_TIMEOUT, 120)
         self.assertEqual(DEFAULT_DIRECT_TOOL_RESULT_MAX_CHARS, 8000)
         self.assertIn("coding assistant", DEFAULT_DIRECT_SYSTEM_PROMPT)
+
+
+class DirectModeFromEnvTest(unittest.TestCase):
+    """Verify env vars wire correctly into GatewayConfig.from_env()."""
+
+    def _required_env(self, tmp: str) -> dict:
+        return {
+            "STATE_ROOT": str(Path(tmp) / "state"),
+            "RUNTIME_ROOT": str(Path(tmp) / "runtime"),
+            "DISCORD_GATEWAY_TOKEN": "x",
+            "CONTROL_GUILD_ID": "1",
+            "CONTROL_CHANNEL_ID": "2",
+            "ALLOWED_USER_IDS": "100",
+            "CODEX_CWD": str(Path(tmp)),
+        }
+
+    def test_direct_env_vars_override_defaults(self) -> None:
+        import tempfile
+        from codex_gateway.config import GatewayConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._required_env(tmp)
+            env.update({
+                "OLLAMA_HOST": "http://ollama.internal:9999",
+                "DIRECT_MAX_ITERATIONS": "5",
+                "DIRECT_CONTEXT_CHARS": "12345",
+                "DIRECT_SHELL_TIMEOUT": "30",
+                "DIRECT_TOOL_RESULT_MAX_CHARS": "1000",
+                "DIRECT_SYSTEM_PROMPT": "custom prompt",
+            })
+            with patch.dict("os.environ", env, clear=True), \
+                 patch("codex_gateway.config.discover_ollama_models", return_value=()):
+                config = GatewayConfig.from_env()
+            self.assertEqual(config.ollama_host, "http://ollama.internal:9999")
+            self.assertEqual(config.direct_max_iterations, 5)
+            self.assertEqual(config.direct_context_chars, 12345)
+            self.assertEqual(config.direct_shell_timeout, 30)
+            self.assertEqual(config.direct_tool_result_max_chars, 1000)
+            self.assertEqual(config.direct_system_prompt, "custom prompt")
+
+    def test_direct_env_vars_use_defaults_when_unset(self) -> None:
+        import tempfile
+        from codex_gateway.config import (
+            GatewayConfig,
+            DEFAULT_OLLAMA_HOST,
+            DEFAULT_DIRECT_MAX_ITERATIONS,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._required_env(tmp)
+            with patch.dict("os.environ", env, clear=True), \
+                 patch("codex_gateway.config.discover_ollama_models", return_value=()):
+                config = GatewayConfig.from_env()
+            self.assertEqual(config.ollama_host, DEFAULT_OLLAMA_HOST)
+            self.assertEqual(config.direct_max_iterations, DEFAULT_DIRECT_MAX_ITERATIONS)
