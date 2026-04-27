@@ -290,3 +290,120 @@ class AgentLoopTest(unittest.TestCase):
             self.assertEqual(summary.exit_code, 0)
             # Should have called chat exactly max_iterations times
             self.assertEqual(mock_client.chat.await_count, 2)
+
+
+class EndToEndSmokeTest(unittest.TestCase):
+    """Simulates a full /ask cycle through direct runner."""
+
+    @patch("codex_gateway.direct_runner.ollama.AsyncClient")
+    def test_full_cycle_with_tool_call_and_conversation_persistence(
+        self, mock_client_cls,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = MagicMock()
+            config.codex_cwd = Path(tmp)
+            config.ollama_host = "http://localhost:11434"
+            config.direct_max_iterations = 5
+            config.direct_context_chars = 90000
+            config.direct_shell_timeout = 10
+            config.direct_tool_result_max_chars = 8000
+            config.direct_system_prompt = "You are a coding assistant."
+            config.status_text_max_chars = 700
+
+            state_root = Path(tmp) / "state"
+            state_root.mkdir()
+            config.state_root = state_root
+            config.last_response_file = state_root / "last_response.txt"
+
+            state = GatewayState(state_root / "gateway_state.json")
+
+            # Create a test file
+            (Path(tmp) / "hello.py").write_text("print('hello')", encoding="utf-8")
+
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+
+            # First call: model uses read_file
+            tool_resp = MagicMock()
+            tool_resp.message = MagicMock()
+            tool_resp.message.content = ""
+            tc = MagicMock()
+            tc.function = MagicMock()
+            tc.function.name = "read_file"
+            tc.function.arguments = {"path": "hello.py"}
+            tool_resp.message.tool_calls = [tc]
+
+            # Second call: model responds with text
+            text_resp = MagicMock()
+            text_resp.message = MagicMock()
+            text_resp.message.content = "The file contains a print statement."
+            text_resp.message.tool_calls = None
+
+            mock_client.chat = AsyncMock(side_effect=[tool_resp, text_resp])
+
+            summary = asyncio.get_event_loop().run_until_complete(
+                run_direct_ollama(
+                    state=state,
+                    config=config,
+                    requester_user_id=42,
+                    requester_name="operator",
+                    prompt="What is in hello.py?",
+                    project_id="proj1",
+                    session_id="sess1",
+                    model_profile="qwen3:8b",
+                )
+            )
+
+            # Verify summary
+            self.assertEqual(summary.exit_code, 0)
+            self.assertIn("print statement", summary.assistant_response_excerpt)
+
+            # Verify conversation was persisted
+            from codex_gateway.conversation_store import ConversationStore
+            store = ConversationStore(state_root)
+            history = store.load("proj1", "sess1")
+            # Should have: user message, assistant (tool call), tool result, assistant (text)
+            roles = [m["role"] for m in history]
+            self.assertIn("user", roles)
+            self.assertIn("assistant", roles)
+            self.assertIn("tool", roles)
+
+    @patch("codex_gateway.direct_runner.ollama.AsyncClient")
+    def test_ollama_connection_failure_returns_spawn_failed(
+        self, mock_client_cls,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = MagicMock()
+            config.codex_cwd = Path(tmp)
+            config.ollama_host = "http://localhost:11434"
+            config.direct_max_iterations = 3
+            config.direct_context_chars = 90000
+            config.direct_shell_timeout = 10
+            config.direct_tool_result_max_chars = 8000
+            config.direct_system_prompt = "You are a coding assistant."
+            config.status_text_max_chars = 700
+            config.state_root = Path(tmp) / "state"
+            config.state_root.mkdir()
+            config.last_response_file = Path(tmp) / "last.txt"
+
+            state = GatewayState(Path(tmp) / "state" / "gw.json")
+
+            mock_client = AsyncMock()
+            mock_client_cls.return_value = mock_client
+            mock_client.chat = AsyncMock(
+                side_effect=ConnectionError("Ollama not running")
+            )
+
+            summary = asyncio.get_event_loop().run_until_complete(
+                run_direct_ollama(
+                    state=state,
+                    config=config,
+                    requester_user_id=1,
+                    requester_name="test",
+                    prompt="hello",
+                    model_profile="qwen3:8b",
+                )
+            )
+
+            self.assertEqual(summary.exit_signal, "SPAWN_FAILED")
+            self.assertIn("Ollama not running", summary.stderr_excerpt)
