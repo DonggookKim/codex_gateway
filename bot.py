@@ -22,6 +22,7 @@ from .formatter import (
 from .last_response_store import refresh_last_response_file
 from .process_inspector import find_codex_processes
 from .project_registry import ProjectDefinition, ProjectRegistry
+from .direct_runner import run_direct_ollama
 from .runner import run_codex, stop_active_run
 from .session_inspector import inspect_latest_codex_response
 from .session_store import SessionRecord, SessionStore
@@ -1276,6 +1277,43 @@ class GatewayClient(discord.Client):
         if project_id and session_id:
             session_record = self._load_session_record(project_id, session_id)
             session_record = await self._materialize_session_record(session_record)
+
+        resolved_execution_env = (
+            session_record.execution_env
+            if session_record is not None
+            else self._determine_execution_env(model_profile or "")
+        )
+
+        if resolved_execution_env == "local_ollama":
+            return await run_direct_ollama(
+                state=self.state,
+                config=self.config,
+                requester_user_id=requester_id,
+                requester_name=requester_name,
+                prompt=prompt,
+                project_id=project_id,
+                session_id=session_id,
+                model_profile=model_profile,
+                execution_env=resolved_execution_env,
+                codex_home_path=(
+                    session_record.codex_home_path
+                    if session_record is not None
+                    else None
+                ),
+                runtime_root=(
+                    session_record.runtime_root
+                    if session_record is not None
+                    else None
+                ),
+                last_response_file=(
+                    session_record.last_response_path
+                    if session_record is not None
+                    else None
+                ),
+                project_label=project_label,
+                session_label=session_label,
+            )
+
         return await run_codex(
             state=self.state,
             config=self.config,
@@ -1288,16 +1326,16 @@ class GatewayClient(discord.Client):
             start_new_session=codex_session_ref is None,
             discord_channel_name=discord_channel_name,
             model_profile=model_profile,
-            execution_env=(
-                session_record.execution_env
-                if session_record is not None
-                else self._determine_execution_env(model_profile or "")
-            ),
+            execution_env=resolved_execution_env,
             codex_home_path=(
-                session_record.codex_home_path if session_record is not None else None
+                session_record.codex_home_path
+                if session_record is not None
+                else None
             ),
             runtime_root=(
-                session_record.runtime_root if session_record is not None else None
+                session_record.runtime_root
+                if session_record is not None
+                else None
             ),
             last_response_file=(
                 session_record.last_response_path
