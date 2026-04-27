@@ -38,3 +38,21 @@ class DiscoverOllamaModelsTest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+
+class DirectModeConfigDefaultsTest(unittest.TestCase):
+    def test_direct_mode_defaults(self) -> None:
+        from codex_gateway.config import (
+            DEFAULT_OLLAMA_HOST,
+            DEFAULT_DIRECT_MAX_ITERATIONS,
+            DEFAULT_DIRECT_CONTEXT_CHARS,
+            DEFAULT_DIRECT_SHELL_TIMEOUT,
+            DEFAULT_DIRECT_TOOL_RESULT_MAX_CHARS,
+            DEFAULT_DIRECT_SYSTEM_PROMPT,
+        )
+        self.assertEqual(DEFAULT_OLLAMA_HOST, "http://localhost:11434")
+        self.assertEqual(DEFAULT_DIRECT_MAX_ITERATIONS, 10)
+        self.assertEqual(DEFAULT_DIRECT_CONTEXT_CHARS, 90000)
+        self.assertEqual(DEFAULT_DIRECT_SHELL_TIMEOUT, 120)
+        self.assertEqual(DEFAULT_DIRECT_TOOL_RESULT_MAX_CHARS, 8000)
+        self.assertIn("coding assistant", DEFAULT_DIRECT_SYSTEM_PROMPT)

@@ -20,6 +20,17 @@ DEFAULT_TMP_DIR = DEFAULT_RUNTIME_ROOT / "tmp"
 DEFAULT_LAST_RESPONSE_FILE = DEFAULT_TMP_DIR / "last_response.txt"
 DEFAULT_LOCAL_CODEX_PROFILE = "ollama-qwen25-coder"
 
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_DIRECT_MAX_ITERATIONS = 10
+DEFAULT_DIRECT_CONTEXT_CHARS = 90000
+DEFAULT_DIRECT_SHELL_TIMEOUT = 120
+DEFAULT_DIRECT_TOOL_RESULT_MAX_CHARS = 8000
+DEFAULT_DIRECT_SYSTEM_PROMPT = """You are a coding assistant. Use the provided tools to help the user.
+Rules:
+- Use tools when you need to read, write, or execute something.
+- Respond in the same language the user uses.
+- Be concise."""
+
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
@@ -150,6 +161,12 @@ class GatewayConfig:
     prompt_preamble: str = DEFAULT_PROMPT_PREAMBLE
     discovered_ollama_models: tuple[str, ...] = ()
     local_codex_profile: str = DEFAULT_LOCAL_CODEX_PROFILE
+    ollama_host: str = DEFAULT_OLLAMA_HOST
+    direct_max_iterations: int = DEFAULT_DIRECT_MAX_ITERATIONS
+    direct_context_chars: int = DEFAULT_DIRECT_CONTEXT_CHARS
+    direct_shell_timeout: int = DEFAULT_DIRECT_SHELL_TIMEOUT
+    direct_tool_result_max_chars: int = DEFAULT_DIRECT_TOOL_RESULT_MAX_CHARS
+    direct_system_prompt: str = DEFAULT_DIRECT_SYSTEM_PROMPT
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
@@ -207,6 +224,24 @@ class GatewayConfig:
             os.environ.get("LOCAL_CODEX_PROFILE", DEFAULT_LOCAL_CODEX_PROFILE).strip()
             or DEFAULT_LOCAL_CODEX_PROFILE
         )
+        ollama_host = os.environ.get(
+            "OLLAMA_HOST", DEFAULT_OLLAMA_HOST
+        ).strip() or DEFAULT_OLLAMA_HOST
+        direct_max_iterations = _int_env(
+            "DIRECT_MAX_ITERATIONS", DEFAULT_DIRECT_MAX_ITERATIONS
+        )
+        direct_context_chars = _int_env(
+            "DIRECT_CONTEXT_CHARS", DEFAULT_DIRECT_CONTEXT_CHARS
+        )
+        direct_shell_timeout = _int_env(
+            "DIRECT_SHELL_TIMEOUT", DEFAULT_DIRECT_SHELL_TIMEOUT
+        )
+        direct_tool_result_max_chars = _int_env(
+            "DIRECT_TOOL_RESULT_MAX_CHARS", DEFAULT_DIRECT_TOOL_RESULT_MAX_CHARS
+        )
+        direct_system_prompt = os.environ.get(
+            "DIRECT_SYSTEM_PROMPT", DEFAULT_DIRECT_SYSTEM_PROMPT
+        ).strip() or DEFAULT_DIRECT_SYSTEM_PROMPT
         discovered_ollama_models = discover_ollama_models()
 
         state_root.mkdir(parents=True, exist_ok=True)
@@ -241,4 +276,10 @@ class GatewayConfig:
             prompt_preamble=prompt_preamble,
             discovered_ollama_models=discovered_ollama_models,
             local_codex_profile=local_codex_profile,
+            ollama_host=ollama_host,
+            direct_max_iterations=direct_max_iterations,
+            direct_context_chars=direct_context_chars,
+            direct_shell_timeout=direct_shell_timeout,
+            direct_tool_result_max_chars=direct_tool_result_max_chars,
+            direct_system_prompt=direct_system_prompt,
         )
