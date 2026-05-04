@@ -98,7 +98,7 @@ class TuiAttachTest(unittest.TestCase):
 
             with self.assertRaises(TuiAttachError):
                 build_attach_command(
-                    repo_root=Path("/mnt/d/study_things/codex_sandbox"),
+                    repo_root=Path("/tmp/codex_sandbox"),
                     project_id="mail",
                     session=session,
                 )
@@ -116,14 +116,14 @@ class TuiAttachTest(unittest.TestCase):
             )
 
             command = build_attach_command(
-                repo_root=Path("/mnt/d/study_things/codex_sandbox"),
+                repo_root=Path("/tmp/codex_sandbox"),
                 project_id="mail",
                 session=session,
             )
 
         self.assertEqual(
             command,
-            "bash /mnt/d/study_things/codex_sandbox/codex_gateway/attach-gateway-session.sh mail abc123",
+            "bash /tmp/codex_sandbox/codex_gateway/attach-gateway-session.sh mail abc123",
         )
 
     def test_build_resume_argv_uses_gpt_model_profile(self) -> None:
@@ -131,7 +131,7 @@ class TuiAttachTest(unittest.TestCase):
             AttachTarget(
                 project_id="mail",
                 session_id="abc123",
-                project_cwd=Path("/mnt/d/study_things/codex_sandbox"),
+                project_cwd=Path("/tmp/codex_sandbox"),
                 home_parent=Path.home() / "codex_gateway_runtime" / "codex-home",
                 thread_ref="019thread-explicit",
                 model_profile="gpt-5.4",
@@ -140,23 +140,6 @@ class TuiAttachTest(unittest.TestCase):
         )
         self.assertIn("-m", argv)
         self.assertIn("gpt-5.4", argv)
-
-    def test_build_resume_argv_uses_local_profile_for_qwen_alias(self) -> None:
-        argv = build_resume_argv(
-            AttachTarget(
-                project_id="mail",
-                session_id="abc123",
-                project_cwd=Path("/mnt/d/study_things/codex_sandbox"),
-                home_parent=Path.home() / "codex_gateway_local_runtime" / "codex-home",
-                thread_ref="019thread-explicit",
-                model_profile="qwen3-8b",
-                execution_env="local_ollama",
-            )
-        )
-        self.assertIn("-p", argv)
-        self.assertIn("ollama-qwen25-coder", argv)
-        self.assertIn("-m", argv)
-        self.assertIn("qwen3:8b", argv)
 
     def test_resolve_attach_target_rejects_unpersisted_thread_ref(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

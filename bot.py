@@ -22,6 +22,12 @@ from .formatter import (
 from .last_response_store import refresh_last_response_file
 from .process_inspector import find_codex_processes
 from .project_registry import ProjectDefinition, ProjectRegistry
+from .backend import RunRequest
+from .backend.opencode_runtime import (
+    OpencodeRuntime,
+    opencode_runtime_settings_from_env,
+)
+from .permission_router import PermissionRouter
 from .runner import run_codex, stop_active_run
 from .session_inspector import inspect_latest_codex_response
 from .session_store import SessionRecord, SessionStore
@@ -33,7 +39,12 @@ LOGGER = logging.getLogger(__name__)
 
 
 class GatewayClient(discord.Client):
-    def __init__(self, config: GatewayConfig, state: GatewayState) -> None:
+    def __init__(
+        self,
+        config: GatewayConfig,
+        state: GatewayState,
+        opencode_runtime: OpencodeRuntime | None = None,
+    ) -> None:
         intents = discord.Intents.default()
         super().__init__(intents=intents)
         self.config = config
@@ -43,6 +54,8 @@ class GatewayClient(discord.Client):
             config.state_root,
             config.runtime_root,
         )
+        self.opencode_runtime = opencode_runtime
+        self.permission_router: PermissionRouter | None = None
         self.tree = app_commands.CommandTree(self)
         self._scheduled_watch_task: asyncio.Task | None = None
         self._register_commands()
@@ -55,6 +68,48 @@ class GatewayClient(discord.Client):
         if interaction.user.id not in self.config.allowed_user_ids:
             return "You are not allowed to control this Codex gateway."
         return None
+
+    def _resolve_project_for_channel(
+        self,
+        channel_id: int | None,
+    ) -> ProjectDefinition | None:
+        if channel_id is None:
+            return None
+        for project in self.project_registry.load_projects():
+            if project.archived:
+                continue
+            if project.project_channel_id == channel_id:
+                return project
+        return None
+
+    def _validate_command_context(
+        self,
+        interaction: discord.Interaction,
+    ) -> tuple[str | None, ProjectDefinition | None]:
+        """Allow the command in the control channel OR in any project channel.
+
+        Returns (denial_message, channel_project). When `channel_project` is
+        not None the command was invoked in that project's bound channel and
+        handlers should treat that project as the implicit target. When None
+        and denial_message is None, the command is in the control channel and
+        handlers should fall back to the gateway-global selection state.
+        """
+        if interaction.guild_id != self.config.control_guild_id:
+            return (
+                "This command is only available in the configured control guild.",
+                None,
+            )
+        if interaction.user.id not in self.config.allowed_user_ids:
+            return ("You are not allowed to control this Codex gateway.", None)
+        if interaction.channel_id == self.config.control_channel_id:
+            return (None, None)
+        channel_project = self._resolve_project_for_channel(interaction.channel_id)
+        if channel_project is None:
+            return (
+                "This command must be used in the control channel or a registered project channel.",
+                None,
+            )
+        return (None, channel_project)
 
     def _load_project_definition(self, project_id: str) -> ProjectDefinition | None:
         for project in self.project_registry.load_projects():
@@ -143,15 +198,21 @@ class GatewayClient(discord.Client):
         interaction: discord.Interaction,
         current: str,
     ) -> list[app_commands.Choice[str]]:
-        selected_project_id = (
-            self.state.selection_state.get("selected_project_id") or ""
-        ).strip()
-        if not selected_project_id:
+        # Prefer the project bound to the channel; fall back to the
+        # gateway-global selection for control-channel invocations.
+        channel_project = self._resolve_project_for_channel(interaction.channel_id)
+        if channel_project is not None:
+            target_project_id = channel_project.project_id
+        else:
+            target_project_id = (
+                self.state.selection_state.get("selected_project_id") or ""
+            ).strip()
+        if not target_project_id:
             return []
 
         needle = current.strip().lower()
         choices: list[app_commands.Choice[str]] = []
-        for session in self._list_session_records(selected_project_id):
+        for session in self._list_session_records(target_project_id):
             haystacks = [
                 session.session_id.lower(),
                 session.label.lower(),
@@ -175,7 +236,6 @@ class GatewayClient(discord.Client):
         for profile in (
             [project.default_model_profile]
             + project.allowed_model_profiles
-            + list(self.config.discovered_ollama_models)
         ):
             cleaned = str(profile).strip()
             if cleaned and cleaned not in profiles:
@@ -183,10 +243,7 @@ class GatewayClient(discord.Client):
         return profiles
 
     def _determine_execution_env(self, model_profile: str) -> str:
-        return infer_execution_env(
-            model_profile,
-            local_model_profiles=self.config.discovered_ollama_models,
-        )
+        return infer_execution_env(model_profile)
 
     async def _model_profile_autocomplete(
         self,
@@ -294,11 +351,15 @@ class GatewayClient(discord.Client):
             interaction: discord.Interaction,
             session_id: str,
         ) -> None:
-            denial = self._validate_control_context(interaction)
+            denial, channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
-            await self._handle_session_select(interaction, session_id)
+            await self._handle_session_select(
+                interaction,
+                session_id,
+                channel_project=channel_project,
+            )
         @session_select.autocomplete("session_id")
         async def session_select_autocomplete(
             interaction: discord.Interaction,
@@ -310,77 +371,112 @@ class GatewayClient(discord.Client):
             name="session_new",
             description="Create and select a new session for the current project.",
         )
-        @app_commands.describe(label="Human-readable label for the new session")
+        @app_commands.describe(
+            label="Human-readable label for the new session",
+            backend="Execution backend; defaults to codex (gpt). Choose opencode for the new opencode-backed flow.",
+        )
+        @app_commands.choices(
+            backend=[
+                app_commands.Choice(name="codex (gpt)", value="codex"),
+                app_commands.Choice(name="opencode", value="opencode"),
+            ]
+        )
         async def session_new(
             interaction: discord.Interaction,
             label: str,
+            backend: app_commands.Choice[str] | None = None,
         ) -> None:
-            denial = self._validate_control_context(interaction)
+            denial, channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
-            await self._handle_session_new(interaction, label)
+            backend_value = backend.value if backend is not None else "codex"
+            await self._handle_session_new(
+                interaction,
+                label,
+                backend=backend_value,
+                channel_project=channel_project,
+            )
 
         @self.tree.command(
             name="session_list",
-            description="List sessions for the currently selected project.",
+            description="List sessions for the project bound to this channel (or the selected one in control).",
         )
         async def session_list(interaction: discord.Interaction) -> None:
-            denial = self._validate_control_context(interaction)
+            denial, channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
-            await self._handle_session_list(interaction)
+            await self._handle_session_list(
+                interaction,
+                channel_project=channel_project,
+            )
 
         @self.tree.command(
             name="model_select",
-            description="Select the model profile for new sessions in the active project.",
+            description="Pick the provider/model for the next opencode-backed session in this project.",
         )
-        @app_commands.describe(model_profile="Model profile to use for new sessions")
+        @app_commands.describe(
+            model_profile="provider/model string (e.g. model-connect/Qwen3.5-...). Codex sessions ignore this.",
+        )
         async def model_select(
             interaction: discord.Interaction,
             model_profile: str,
         ) -> None:
-            denial = self._validate_control_context(interaction)
+            denial, channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
-            await self._handle_model_select(interaction, model_profile)
+            await self._handle_model_select(
+                interaction,
+                model_profile,
+                channel_project=channel_project,
+            )
         model_select.autocomplete("model_profile")(self._model_profile_autocomplete)
 
         @self.tree.command(
             name="ask",
-            description="Send a follow-up prompt to the latest Codex session.",
+            description="Send a follow-up prompt. Targets the project bound to this channel, or the selected one in control.",
         )
         @app_commands.describe(prompt="Prompt to send to Codex")
         async def ask(interaction: discord.Interaction, prompt: str) -> None:
-            denial = self._validate_control_context(interaction)
+            denial, channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
-            await self._handle_ask(interaction, prompt)
+            await self._handle_ask(
+                interaction,
+                prompt,
+                channel_project=channel_project,
+            )
 
         @self.tree.command(
             name="status",
-            description="Show the current gateway state and last run summary.",
+            description="Show the gateway state and last run summary (project-scoped when used in a project channel).",
         )
         async def status(interaction: discord.Interaction) -> None:
-            denial = self._validate_control_context(interaction)
+            denial, channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
-            await self._handle_status(interaction)
+            await self._handle_status(
+                interaction,
+                channel_project=channel_project,
+            )
 
         @self.tree.command(
             name="current",
-            description="Show the currently selected project and session.",
+            description="Show the active project/session (channel-scoped in a project channel).",
         )
         async def current(interaction: discord.Interaction) -> None:
-            denial = self._validate_control_context(interaction)
+            denial, channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
-            await self._handle_current(interaction)
+            await self._handle_current(
+                interaction,
+                channel_project=channel_project,
+            )
 
         @self.tree.command(
             name="tui",
@@ -433,6 +529,66 @@ class GatewayClient(discord.Client):
             await interaction.response.defer()
             result = await stop_active_run(self.state, self.config)
             await interaction.followup.send(limit_discord_message(result.message))
+
+        @self.tree.command(
+            name="perms",
+            description="List pending opencode permission asks for the channel's project (or selected one in control).",
+        )
+        async def perms(interaction: discord.Interaction) -> None:
+            denial, channel_project = self._validate_command_context(interaction)
+            if denial:
+                await interaction.response.send_message(denial, ephemeral=True)
+                return
+            await self._handle_perms(
+                interaction,
+                channel_project=channel_project,
+            )
+
+        @self.tree.command(
+            name="perm_allow",
+            description="Approve a pending opencode permission ask.",
+        )
+        @app_commands.describe(
+            permission_id="permission id (per_...); leave blank to use the latest pending for the active session",
+            scope="`once` (default) or `always`",
+        )
+        async def perm_allow(
+            interaction: discord.Interaction,
+            permission_id: str = "",
+            scope: str = "once",
+        ) -> None:
+            denial, channel_project = self._validate_command_context(interaction)
+            if denial:
+                await interaction.response.send_message(denial, ephemeral=True)
+                return
+            await self._handle_perm_response(
+                interaction,
+                permission_id=permission_id.strip(),
+                response=scope.strip().lower() or "once",
+                channel_project=channel_project,
+            )
+
+        @self.tree.command(
+            name="perm_reject",
+            description="Reject a pending opencode permission ask.",
+        )
+        @app_commands.describe(
+            permission_id="permission id (per_...); leave blank to use the latest pending for the active session",
+        )
+        async def perm_reject(
+            interaction: discord.Interaction,
+            permission_id: str = "",
+        ) -> None:
+            denial, channel_project = self._validate_command_context(interaction)
+            if denial:
+                await interaction.response.send_message(denial, ephemeral=True)
+                return
+            await self._handle_perm_response(
+                interaction,
+                permission_id=permission_id.strip(),
+                response="reject",
+                channel_project=channel_project,
+            )
 
     async def setup_hook(self) -> None:
         guild = discord.Object(id=self.config.control_guild_id)
@@ -517,9 +673,10 @@ class GatewayClient(discord.Client):
             return
 
         self.state.select_project(project.project_id)
-        self.state.select_model_profile_for_new_session(
-            project.default_model_profile or None
-        )
+        # /model_select is now a per-project pending value resolved at
+        # /session_new time; no longer prefilled here, since the project
+        # default is only meaningful for codex sessions which read it
+        # directly from ProjectDefinition.default_model_profile.
         if not self.state.selection_state.get("watched_project_id"):
             self._cancel_scheduled_watch()
         await interaction.response.send_message(
@@ -585,13 +742,20 @@ class GatewayClient(discord.Client):
         self,
         interaction: discord.Interaction,
         session_id: str,
+        *,
+        channel_project: ProjectDefinition | None = None,
     ) -> None:
-        selected_project_id = (
-            self.state.selection_state.get("selected_project_id") or ""
-        ).strip()
-        if not selected_project_id:
+        # In a project channel: route to that project. In control: fall back
+        # to the gateway-global selection.
+        if channel_project is not None:
+            target_project_id = channel_project.project_id
+        else:
+            target_project_id = (
+                self.state.selection_state.get("selected_project_id") or ""
+            ).strip()
+        if not target_project_id:
             await interaction.response.send_message(
-                "Select a project first with `/project_select`.",
+                "Select a project first with `/project_select`, or invoke this in a project channel.",
                 ephemeral=True,
             )
             return
@@ -606,7 +770,7 @@ class GatewayClient(discord.Client):
 
         try:
             session = self._load_session_record(
-                selected_project_id,
+                target_project_id,
                 cleaned_session_id,
             )
         except ValueError:
@@ -616,27 +780,33 @@ class GatewayClient(discord.Client):
             await interaction.response.send_message(
                 (
                     "Unknown session for project "
-                    f"`{selected_project_id}`: `{cleaned_session_id}`"
+                    f"`{target_project_id}`: `{cleaned_session_id}`"
                 ),
                 ephemeral=True,
             )
             return
 
-        self.state.select_session(session.session_id)
+        # In control channel updates also flip the gateway-global selection
+        # so subsequent control-channel commands see it. In a project
+        # channel only the project-local active_session_id is updated, so
+        # other channels are not disturbed.
+        if channel_project is None:
+            self.state.select_session(session.session_id)
+            if not self.state.selection_state.get("watched_session_id"):
+                self._cancel_scheduled_watch()
         try:
             self._persist_project_active_session(
-                selected_project_id,
+                target_project_id,
                 session.session_id,
             )
         except ValueError:
             LOGGER.exception("Failed to persist project active session")
-        if not self.state.selection_state.get("watched_session_id"):
-            self._cancel_scheduled_watch()
         session_label = session.label or session.session_id
+        scope_hint = "channel" if channel_project is not None else "gateway"
         await interaction.response.send_message(
             limit_discord_message(
-                "Selected session: "
-                f"`{selected_project_id}/{session.session_id}`"
+                f"Selected session ({scope_hint}): "
+                f"`{target_project_id}/{session.session_id}`"
                 + (
                     f" ({session_label})"
                     if session_label != session.session_id
@@ -646,26 +816,34 @@ class GatewayClient(discord.Client):
             ephemeral=False,
         )
 
-    async def _handle_session_list(self, interaction: discord.Interaction) -> None:
-        selected_project_id = (
-            self.state.selection_state.get("selected_project_id") or ""
-        ).strip()
-        if not selected_project_id:
+    async def _handle_session_list(
+        self,
+        interaction: discord.Interaction,
+        *,
+        channel_project: ProjectDefinition | None = None,
+    ) -> None:
+        if channel_project is not None:
+            target_project_id = channel_project.project_id
+        else:
+            target_project_id = (
+                self.state.selection_state.get("selected_project_id") or ""
+            ).strip()
+        if not target_project_id:
             await interaction.response.send_message(
-                "Select a project first with `/project_select`.",
+                "Select a project first with `/project_select`, or invoke this in a project channel.",
                 ephemeral=True,
             )
             return
 
-        sessions = self._list_session_records(selected_project_id)
+        sessions = self._list_session_records(target_project_id)
         if not sessions:
             await interaction.response.send_message(
-                f"No sessions found for `{selected_project_id}`.",
+                f"No sessions found for `{target_project_id}`.",
                 ephemeral=True,
             )
             return
 
-        lines = [f"Sessions for `{selected_project_id}`:"]
+        lines = [f"Sessions for `{target_project_id}`:"]
         for session in sessions[:25]:
             preview = ""
             if session.last_prompt_excerpt:
@@ -689,16 +867,32 @@ class GatewayClient(discord.Client):
         self,
         interaction: discord.Interaction,
         label: str,
+        *,
+        backend: str = "codex",
+        channel_project: ProjectDefinition | None = None,
     ) -> None:
-        selected_project_id = (
-            self.state.selection_state.get("selected_project_id") or ""
-        ).strip()
-        if not selected_project_id:
-            await interaction.response.send_message(
-                "Select a project first with `/project_select`.",
-                ephemeral=True,
-            )
-            return
+        # Channel-routed creates target the channel's project; control-channel
+        # creates target the gateway-globally-selected project.
+        if channel_project is not None:
+            target_project_id = channel_project.project_id
+            project = channel_project
+        else:
+            target_project_id = (
+                self.state.selection_state.get("selected_project_id") or ""
+            ).strip()
+            if not target_project_id:
+                await interaction.response.send_message(
+                    "Select a project first with `/project_select`, or invoke this in a project channel.",
+                    ephemeral=True,
+                )
+                return
+            project = self._load_project_definition(target_project_id)
+            if project is None:
+                await interaction.response.send_message(
+                    f"Selected project is unavailable: `{target_project_id}`",
+                    ephemeral=True,
+                )
+                return
 
         cleaned_label = label.strip()
         if not cleaned_label:
@@ -708,59 +902,106 @@ class GatewayClient(discord.Client):
             )
             return
 
-        project = self._load_project_definition(selected_project_id)
-        if project is None:
+        if backend == "opencode":
+            if self.opencode_runtime is None:
+                await interaction.response.send_message(
+                    "OpenCode backend is not configured on this gateway. "
+                    "Set OPENCODE_GATEWAY_ENABLED=1 with provider/model env vars.",
+                    ephemeral=True,
+                )
+                return
+            model_profile = (
+                self.state.get_pending_model_profile(target_project_id)
+                or self._opencode_default_model_profile()
+            )
+        elif backend == "codex":
+            # Codex sessions intentionally ignore /model_select; the project
+            # default is the source of truth for model bound at creation.
+            model_profile = project.default_model_profile
+        else:
             await interaction.response.send_message(
-                f"Selected project is unavailable: `{selected_project_id}`",
+                f"Unknown backend: `{backend}` (expected `codex` or `opencode`).",
                 ephemeral=True,
             )
             return
 
-        model_profile = (
-            self.state.selection_state.get("selected_model_profile_for_new_session")
-            or project.default_model_profile
-        )
         if not model_profile:
             await interaction.response.send_message(
-                f"No default model is configured for `{selected_project_id}`.",
+                (
+                    f"No model is available for new `{backend}` sessions in "
+                    f"`{target_project_id}`."
+                    + (
+                        " Set `default_model_profile` on the project."
+                        if backend == "codex"
+                        else " Use `/model_select` or configure OPENCODE_PROVIDER_ID/MODEL_ID."
+                    )
+                ),
                 ephemeral=True,
             )
             return
 
         session = self.session_store.create_session(
-            project_id=selected_project_id,
+            project_id=target_project_id,
             label=cleaned_label,
             model_profile=model_profile,
             execution_env=self._determine_execution_env(model_profile),
+            backend=backend,
         )
-        self.state.select_session(session.session_id)
+        # Channel-routed creates only update the project's active_session_id.
+        # Control-channel creates also flip the gateway-global selection.
+        if channel_project is None:
+            self.state.select_session(session.session_id)
         self._persist_project_active_session(
-            selected_project_id,
+            target_project_id,
             session.session_id,
         )
+        scope_hint = "channel" if channel_project is not None else "gateway"
         await interaction.response.send_message(
             limit_discord_message(
-                "Created and selected session: "
-                f"`{selected_project_id}/{session.session_id}`"
-                f" ({cleaned_label}) model=`{model_profile}`"
+                f"Created session ({scope_hint}): "
+                f"`{target_project_id}/{session.session_id}`"
+                f" ({cleaned_label}) backend=`{backend}` model=`{model_profile}`"
             ),
             ephemeral=False,
         )
+
+    def _opencode_default_model_profile(self) -> str | None:
+        if self.opencode_runtime is None:
+            return None
+        s = self.opencode_runtime.settings
+        return f"{s.provider_id}/{s.model_id}"
 
     async def _handle_model_select(
         self,
         interaction: discord.Interaction,
         model_profile: str,
+        *,
+        channel_project: ProjectDefinition | None = None,
     ) -> None:
-        selected_project_id = (
-            self.state.selection_state.get("selected_project_id") or ""
-        ).strip()
-        if not selected_project_id:
-            await interaction.response.send_message(
-                "Select a project first with `/project_select`.",
-                ephemeral=True,
-            )
-            return
+        if channel_project is not None:
+            target_project_id = channel_project.project_id
+            project = channel_project
+        else:
+            target_project_id = (
+                self.state.selection_state.get("selected_project_id") or ""
+            ).strip()
+            if not target_project_id:
+                await interaction.response.send_message(
+                    "Select a project first with `/project_select`, or invoke this in a project channel.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                project = self._load_project_definition(target_project_id)
+            except ValueError:
+                LOGGER.exception("Failed to load project registry")
+                project = None
+            if project is None:
+                await interaction.response.send_message(
+                    f"Selected project is unavailable: `{target_project_id}`",
+                    ephemeral=True,
+                )
+                return
 
         cleaned_model_profile = model_profile.strip()
         if not cleaned_model_profile:
@@ -770,38 +1011,44 @@ class GatewayClient(discord.Client):
             )
             return
 
-        try:
-            project = self._load_project_definition(selected_project_id)
-        except ValueError:
-            LOGGER.exception("Failed to load project registry")
-            project = None
-
-        if project is None:
-            await interaction.response.send_message(
-                f"Selected project is unavailable: `{selected_project_id}`",
-                ephemeral=True,
-            )
-            return
-
+        # /model_select is now scoped to opencode session creation per
+        # project. Accept either a project-allowed codex profile (legacy
+        # compat, harmless because codex sessions ignore the pending value)
+        # or a free-form provider/model string for opencode.
         allowed_model_profiles = self._allowed_model_profiles(project)
-        if allowed_model_profiles and cleaned_model_profile not in allowed_model_profiles:
+        looks_like_opencode = "/" in cleaned_model_profile
+        if (
+            allowed_model_profiles
+            and cleaned_model_profile not in allowed_model_profiles
+            and not looks_like_opencode
+        ):
             allowed = ", ".join(
                 f"`{profile}`" for profile in allowed_model_profiles
             )
             await interaction.response.send_message(
                 (
                     f"Model `{cleaned_model_profile}` is not allowed for "
-                    f"`{selected_project_id}`. Allowed: {allowed}"
+                    f"`{target_project_id}` and does not look like an "
+                    f"opencode `provider/model` string. Allowed codex profiles: "
+                    f"{allowed}"
                 ),
                 ephemeral=True,
             )
             return
 
-        self.state.select_model_profile_for_new_session(cleaned_model_profile)
+        self.state.set_pending_model_profile(
+            target_project_id,
+            cleaned_model_profile,
+        )
+        scope_note = (
+            "(applies to the next opencode session creation in this project)"
+            if looks_like_opencode
+            else "(applies only when /session_new is run with backend=opencode in this project)"
+        )
         await interaction.response.send_message(
             limit_discord_message(
-                "Selected model for new sessions in "
-                f"`{selected_project_id}`: `{cleaned_model_profile}`"
+                f"Selected model for new sessions in "
+                f"`{target_project_id}`: `{cleaned_model_profile}` {scope_note}"
             ),
             ephemeral=False,
         )
@@ -894,8 +1141,12 @@ class GatewayClient(discord.Client):
                 ephemeral=True,
             )
             return
-        session = await self._materialize_session_record(session)
 
+        if session.backend == "opencode":
+            await self._reply_opencode_tui(interaction, session)
+            return
+
+        session = await self._materialize_session_record(session)
         try:
             attach_target = resolve_attach_target(
                 state_root=self.config.state_root,
@@ -928,10 +1179,60 @@ class GatewayClient(discord.Client):
             ephemeral=False,
         )
 
+    async def _reply_opencode_tui(
+        self,
+        interaction: discord.Interaction,
+        session: SessionRecord,
+    ) -> None:
+        if self.opencode_runtime is None:
+            await interaction.response.send_message(
+                "OpenCode runtime is not configured on this gateway, "
+                "so an opencode-backed session cannot be attached. "
+                "Set the OPENCODE_GATEWAY_ENABLED env var first.",
+                ephemeral=True,
+            )
+            return
+        opencode_session_id = (session.codex_thread_ref or "").strip()
+        if not opencode_session_id:
+            await interaction.response.send_message(
+                "This opencode session has not been opened yet "
+                "(no opencode session ID recorded). Send an `/ask` first.",
+                ephemeral=True,
+            )
+            return
+        server_settings = self.opencode_runtime.settings.server
+        url = f"http://{server_settings.hostname}:{server_settings.port}"
+        password_arg = (
+            f" --password '{server_settings.password}'"
+            if server_settings.password
+            else ""
+        )
+        command = (
+            f"opencode attach {url} --session {opencode_session_id}{password_arg}"
+        )
+        await interaction.response.send_message(
+            limit_discord_message(
+                "Run this in a local terminal to attach an opencode TUI to "
+                "the selected gateway session:\n"
+                f"`{command}`\n"
+                f"Opencode session: `{opencode_session_id}`"
+                + (
+                    "\nNote: the local terminal must be able to reach the "
+                    f"opencode server at `{url}` (use SSH tunneling for "
+                    "remote hosts)."
+                    if server_settings.hostname not in {"127.0.0.1", "localhost"}
+                    else ""
+                )
+            ),
+            ephemeral=False,
+        )
+
     async def _handle_ask(
         self,
         interaction: discord.Interaction,
         prompt: str,
+        *,
+        channel_project: ProjectDefinition | None = None,
     ) -> None:
         cleaned_prompt = prompt.strip()
         if not cleaned_prompt:
@@ -951,39 +1252,50 @@ class GatewayClient(discord.Client):
             return
         if interaction.channel is None:
             await interaction.response.send_message(
-                "Control channel is unavailable.",
+                "Channel is unavailable.",
                 ephemeral=True,
             )
             return
 
-        selected_project_id = (
-            self.state.selection_state.get("selected_project_id") or ""
-        ).strip()
-        if not selected_project_id:
-            await interaction.response.send_message(
-                "Select a project first with `/project_select`.",
-                ephemeral=True,
-            )
-            return
+        # Resolve project + session: project channel binds the project and
+        # uses ProjectDefinition.active_session_id; control channel uses the
+        # gateway-global selection.
+        if channel_project is not None:
+            selected_project_id = channel_project.project_id
+            selected_session_id = (channel_project.active_session_id or "").strip()
+            project = channel_project
+        else:
+            selected_project_id = (
+                self.state.selection_state.get("selected_project_id") or ""
+            ).strip()
+            if not selected_project_id:
+                await interaction.response.send_message(
+                    "Select a project first with `/project_select`, or invoke this in a project channel.",
+                    ephemeral=True,
+                )
+                return
+            selected_session_id = (
+                self.state.selection_state.get("selected_session_id") or ""
+            ).strip()
+            try:
+                project = self._load_project_definition(selected_project_id)
+            except ValueError:
+                LOGGER.exception("Failed to load project registry")
+                project = None
+            if project is None:
+                await interaction.response.send_message(
+                    f"Selected project is unavailable: `{selected_project_id}`",
+                    ephemeral=True,
+                )
+                return
 
-        selected_session_id = (
-            self.state.selection_state.get("selected_session_id") or ""
-        ).strip()
         if not selected_session_id:
             await interaction.response.send_message(
-                "Select a session first with `/session_select`.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            project = self._load_project_definition(selected_project_id)
-        except ValueError:
-            LOGGER.exception("Failed to load project registry")
-            project = None
-        if project is None:
-            await interaction.response.send_message(
-                f"Selected project is unavailable: `{selected_project_id}`",
+                (
+                    "No session selected for "
+                    f"`{selected_project_id}`. "
+                    "Use `/session_select` (or `/session_new`) first."
+                ),
                 ephemeral=True,
             )
             return
@@ -1063,25 +1375,35 @@ class GatewayClient(discord.Client):
             )
         )
 
-    async def _handle_status(self, interaction: discord.Interaction) -> None:
+    async def _handle_status(
+        self,
+        interaction: discord.Interaction,
+        *,
+        channel_project: ProjectDefinition | None = None,
+    ) -> None:
         if not await self._safe_defer(interaction):
             return
-        bound_model_profile = self._selected_session_model_profile()
-        bound_execution_env = self._selected_session_execution_env()
+        target_session = self._resolve_active_session_for_command(channel_project)
+        bound_backend = target_session.backend if target_session else None
+        bound_model_profile = (
+            target_session.model_profile if target_session else None
+        )
+        bound_execution_env = (
+            target_session.execution_env if target_session else None
+        )
         external_codex_activity = await self._run_blocking(
             self._has_external_codex_activity
         )
         latest_response = None
-        selected_session = self._selected_session_record()
-        if selected_session is not None:
-            selected_session = await self._materialize_session_record(selected_session)
+        if target_session is not None:
+            target_session = await self._materialize_session_record(target_session)
             latest_response = await self._run_blocking(
                 inspect_latest_codex_response,
-                selected_session.codex_home_path,
+                target_session.codex_home_path,
             )
             await self._run_blocking(
                 refresh_last_response_file,
-                selected_session.last_response_path,
+                target_session.last_response_path,
                 latest_response,
             )
         await self._safe_followup_send(
@@ -1094,31 +1416,48 @@ class GatewayClient(discord.Client):
                 external_codex_activity=external_codex_activity,
                 bound_model_profile=bound_model_profile,
                 bound_execution_env=bound_execution_env,
+                bound_backend=bound_backend,
+                project_scope_id=(
+                    channel_project.project_id if channel_project is not None else None
+                ),
             ),
         )
 
-    async def _handle_current(self, interaction: discord.Interaction) -> None:
-        selected_project_id = (
-            self.state.selection_state.get("selected_project_id") or ""
-        ).strip()
-        selected_session_id = (
-            self.state.selection_state.get("selected_session_id") or ""
-        ).strip()
-        if not selected_project_id:
-            await interaction.response.send_message(
-                "No project is currently selected.",
-                ephemeral=True,
-            )
-            return
+    async def _handle_current(
+        self,
+        interaction: discord.Interaction,
+        *,
+        channel_project: ProjectDefinition | None = None,
+    ) -> None:
+        # Channel-routed view shows the channel's project + that project's
+        # active_session_id. Control view shows the gateway-globally
+        # selected project/session.
+        if channel_project is not None:
+            target_project_id = channel_project.project_id
+            target_session_id = (channel_project.active_session_id or "").strip()
+            project = channel_project
+        else:
+            target_project_id = (
+                self.state.selection_state.get("selected_project_id") or ""
+            ).strip()
+            target_session_id = (
+                self.state.selection_state.get("selected_session_id") or ""
+            ).strip()
+            if not target_project_id:
+                await interaction.response.send_message(
+                    "No project is currently selected.",
+                    ephemeral=True,
+                )
+                return
+            project = self._load_project_definition(target_project_id)
 
-        project = self._load_project_definition(selected_project_id)
         session = None
-        if selected_session_id:
-            session = self._load_session_record(selected_project_id, selected_session_id)
+        if target_session_id:
+            session = self._load_session_record(target_project_id, target_session_id)
 
         watch_on = (
-            self.state.selection_state.get("watched_project_id") == selected_project_id
-            and self.state.selection_state.get("watched_session_id") == selected_session_id
+            self.state.selection_state.get("watched_project_id") == target_project_id
+            and self.state.selection_state.get("watched_session_id") == target_session_id
         )
         interval_raw = self.state.selection_state.get("watch_interval_seconds")
         interval_text = ""
@@ -1128,9 +1467,10 @@ class GatewayClient(discord.Client):
             except ValueError:
                 interval_text = str(interval_raw)
 
+        scope_hint = "channel" if channel_project is not None else "gateway"
         lines = [
-            "Current selection",
-            f"Project: `{selected_project_id}`"
+            f"Current selection ({scope_hint})",
+            f"Project: `{target_project_id}`"
             + (
                 f" ({project.label})"
                 if project is not None and project.label
@@ -1138,14 +1478,15 @@ class GatewayClient(discord.Client):
             ),
         ]
         if session is None:
-            if selected_session_id:
-                lines.append(f"Session: `{selected_session_id}` (unavailable)")
+            if target_session_id:
+                lines.append(f"Session: `{target_session_id}` (unavailable)")
             else:
                 lines.append("Session: `none`")
         else:
             lines.append(
                 f"Session: `{session.session_id}` ({session.label}) status=`{session.status}`"
             )
+            lines.append(f"Backend: `{session.backend}`")
             lines.append(f"Model: `{session.model_profile}`")
             lines.append(f"Execution env: `{session.execution_env}`")
             if session.codex_thread_ref:
@@ -1276,6 +1617,20 @@ class GatewayClient(discord.Client):
         if project_id and session_id:
             session_record = self._load_session_record(project_id, session_id)
             session_record = await self._materialize_session_record(session_record)
+
+        if session_record is not None and session_record.backend == "opencode":
+            return await self._run_opencode_attempt(
+                requester_id=requester_id,
+                requester_name=requester_name,
+                prompt=prompt,
+                project_id=project_id,
+                session_id=session_id,
+                opencode_session_ref=codex_session_ref,
+                model_profile=model_profile,
+                project_label=project_label,
+                session_label=session_label,
+            )
+
         return await run_codex(
             state=self.state,
             config=self.config,
@@ -1308,6 +1663,178 @@ class GatewayClient(discord.Client):
             session_label=session_label,
         )
 
+    async def _run_opencode_attempt(
+        self,
+        *,
+        requester_id: int,
+        requester_name: str,
+        prompt: str,
+        project_id: str | None,
+        session_id: str | None,
+        opencode_session_ref: str | None,
+        model_profile: str | None,
+        project_label: str | None,
+        session_label: str | None,
+    ) -> LastRunSummary:
+        if self.opencode_runtime is None:
+            raise RuntimeError(
+                "OpenCode session selected but no OpencodeRuntime is configured. "
+                "Set OPENCODE_GATEWAY_ENABLED=1 with provider/model env vars."
+            )
+        backend = await self.opencode_runtime.start()
+        if self.permission_router is None:
+            self.permission_router = PermissionRouter(
+                gateway_client=self,
+                opencode_client=self.opencode_runtime.client,
+                timeout_seconds=self.opencode_runtime.settings.idle_timeout_seconds,
+                allowed_user_ids=self.config.allowed_user_ids,
+            )
+            self.opencode_runtime.set_permission_callback(
+                self.permission_router.on_permission_asked
+            )
+        request = RunRequest(
+            requester_user_id=requester_id,
+            requester_name=requester_name,
+            prompt=prompt,
+            project_id=project_id,
+            session_id=session_id,
+            session_ref=opencode_session_ref,
+            start_new_session=opencode_session_ref is None,
+            model_profile=model_profile,
+            project_label=project_label,
+            session_label=session_label,
+        )
+        return await backend.run(self.state, self.config, request)
+
+    def _resolve_active_session_for_command(
+        self,
+        channel_project: ProjectDefinition | None,
+    ) -> SessionRecord | None:
+        """Pick the session a command should act on for the given context.
+
+        Project-channel: that project's `active_session_id`.
+        Control-channel: the gateway-globally selected session.
+        """
+        if channel_project is not None:
+            session_id = (channel_project.active_session_id or "").strip()
+            if not session_id:
+                return None
+            return self._load_session_record(channel_project.project_id, session_id)
+        return self._selected_session_record()
+
+    async def _handle_perms(
+        self,
+        interaction: discord.Interaction,
+        *,
+        channel_project: ProjectDefinition | None = None,
+    ) -> None:
+        if self.permission_router is None or not self.permission_router.pending:
+            await interaction.response.send_message(
+                "No pending opencode permission asks.",
+                ephemeral=True,
+            )
+            return
+
+        if channel_project is not None:
+            # Filter to opencode sessions known to live under this channel's
+            # project.
+            project_id = channel_project.project_id
+            opencode_session_ids = {
+                session.codex_thread_ref
+                for session in self._list_session_records(project_id)
+                if session.codex_thread_ref
+            }
+            pending = [
+                p
+                for p in self.permission_router.list_pending()
+                if p.ask.session_id in opencode_session_ids
+            ]
+            scope_label = f"project `{project_id}`"
+        else:
+            target_record = self._resolve_active_session_for_command(None)
+            opencode_session_id = (
+                target_record.codex_thread_ref if target_record is not None else None
+            )
+            if opencode_session_id:
+                pending = self.permission_router.list_pending(opencode_session_id)
+                scope_label = (
+                    f"selected session `{target_record.session_id}`"
+                    if target_record is not None
+                    else "selected session"
+                )
+            else:
+                pending = self.permission_router.list_pending()
+                scope_label = "all sessions"
+
+        if not pending:
+            await interaction.response.send_message(
+                f"No pending opencode permission asks for {scope_label}.",
+                ephemeral=True,
+            )
+            return
+
+        lines = [f"Pending permission asks for {scope_label}:"]
+        for pending_perm in pending:
+            ask = pending_perm.ask
+            lines.append(
+                f"- `{ask.permission_id}` "
+                f"perm=`{ask.permission}` "
+                f"patterns={ask.patterns!r} "
+                f"opencode-session=`{ask.session_id}`"
+            )
+        await interaction.response.send_message(
+            limit_discord_message("\n".join(lines)),
+            ephemeral=True,
+        )
+
+    async def _handle_perm_response(
+        self,
+        interaction: discord.Interaction,
+        *,
+        permission_id: str,
+        response: str,
+        channel_project: ProjectDefinition | None = None,
+    ) -> None:
+        if self.permission_router is None:
+            await interaction.response.send_message(
+                "Permission router is not active. Run an opencode-backed `/ask` first.",
+                ephemeral=True,
+            )
+            return
+
+        target_id = permission_id
+        if not target_id:
+            target_record = self._resolve_active_session_for_command(channel_project)
+            opencode_session_id = (
+                target_record.codex_thread_ref if target_record is not None else None
+            )
+            if not opencode_session_id:
+                hint = (
+                    "Either pass a `permission_id`, select a session in this "
+                    "channel's project, or invoke from the control channel "
+                    "with a session selected."
+                )
+                await interaction.response.send_message(hint, ephemeral=True)
+                return
+            latest = self.permission_router.get_latest_pending_for_session(
+                opencode_session_id
+            )
+            if latest is None:
+                await interaction.response.send_message(
+                    "No pending permission asks for the active session.",
+                    ephemeral=True,
+                )
+                return
+            target_id = latest.ask.permission_id
+
+        await interaction.response.defer(ephemeral=True)
+        ok, message = await self.permission_router.respond(
+            target_id,
+            response,
+            responder_label=str(interaction.user),
+        )
+        await interaction.followup.send(message, ephemeral=True)
+
     def _should_retry_missing_rollout(self, summary: LastRunSummary) -> bool:
         if summary.exit_code == 0:
             return False
@@ -1328,6 +1855,12 @@ class GatewayClient(discord.Client):
         if session is None:
             return None
         return session.execution_env or None
+
+    def _selected_session_backend(self) -> str | None:
+        session = self._selected_session_record()
+        if session is None:
+            return None
+        return session.backend or None
 
     def _selected_session_record(self) -> SessionRecord | None:
         project_id = (self.state.selection_state.get("selected_project_id") or "").strip()
@@ -1568,5 +2101,30 @@ def main() -> None:
     )
     config = GatewayConfig.from_env()
     state = GatewayState(config.state_file)
-    client = GatewayClient(config=config, state=state)
-    client.run(config.discord_gateway_token)
+
+    opencode_runtime: OpencodeRuntime | None = None
+    runtime_settings = opencode_runtime_settings_from_env()
+    if runtime_settings is not None:
+        opencode_runtime = OpencodeRuntime(runtime_settings)
+        LOGGER.info(
+            "OpencodeRuntime enabled: provider=%s model=%s server=%s:%s",
+            runtime_settings.provider_id,
+            runtime_settings.model_id,
+            runtime_settings.server.hostname,
+            runtime_settings.server.port,
+        )
+
+    client = GatewayClient(
+        config=config,
+        state=state,
+        opencode_runtime=opencode_runtime,
+    )
+    try:
+        client.run(config.discord_gateway_token)
+    finally:
+        if opencode_runtime is not None and opencode_runtime.started:
+            try:
+                asyncio.run(opencode_runtime.stop())
+            except RuntimeError:
+                # Event loop already closed by discord.py teardown.
+                pass

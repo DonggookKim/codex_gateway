@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .backend import StopResult
 from .config import GatewayConfig
-from .execution_env import LOCAL_OLLAMA_ENV, OPENAI_ENV
+from .execution_env import OPENAI_ENV
 from .formatter import excerpt
 from .last_response_store import write_last_response_text
 from .notification_router import build_project_notification
@@ -25,12 +26,6 @@ class TailBuffer:
 
     def append(self, chunk: str) -> None:
         self.text = (self.text + chunk)[-self.limit :]
-
-
-@dataclass
-class StopResult:
-    attempted: bool
-    message: str
 
 
 @dataclass(frozen=True)
@@ -93,25 +88,14 @@ def build_command(
     last_message_path: Path,
     discord_channel_name: str | None = None,
     model_profile: str | None = None,
-    local_model_profiles: set[str] | tuple[str, ...] | None = None,
-    local_codex_profile: str = "ollama-qwen25-coder",
 ) -> list[str]:
     command = [
         codex_bin,
         "exec",
     ]
-    exec_level_options: list[str] = []
     resume_level_options: list[str] = []
-    normalized_local_models = set(local_model_profiles or ())
-    if model_profile == "qwen3-8b":
-        exec_level_options.extend(["-p", local_codex_profile])
-        resume_level_options.extend(["-m", "qwen3:8b"])
-    elif model_profile in normalized_local_models:
-        exec_level_options.extend(["-p", local_codex_profile])
+    if model_profile:
         resume_level_options.extend(["-m", model_profile])
-    elif model_profile:
-        resume_level_options.extend(["-m", model_profile])
-    command.extend(exec_level_options)
     if not session_ref:
         command.extend(["--json", "--skip-git-repo-check"])
     else:
@@ -274,13 +258,6 @@ def _ensure_shared_auth_link(
     target.symlink_to(shared_auth_source)
 
 
-def _remove_auth_file(codex_dir: Path) -> None:
-    target = codex_dir / "auth.json"
-    if not target.exists() and not target.is_symlink():
-        return
-    target.unlink()
-
-
 def prepare_runtime_home_dir(
     *,
     home_parent: Path,
@@ -303,8 +280,6 @@ def prepare_runtime_home_dir(
             codex_dir,
             shared_auth_source=shared_auth_source,
         )
-    else:
-        _remove_auth_file(codex_dir)
 
 
 def _prepare_runtime_home(config: GatewayConfig) -> dict[str, str] | None:
@@ -336,12 +311,11 @@ def _resolve_execution_settings(
         if runtime_root is not None
         else config.tmp_dir
     )
+    del execution_env  # retained for backwards-compatible call sites
     tmp_dir.mkdir(parents=True, exist_ok=True)
     seed_from = config.codex_home_seed_from
-    use_shared_auth = execution_env != LOCAL_OLLAMA_ENV
-    shared_auth_source = (
-        _resolve_shared_auth_source() if use_shared_auth else None
-    )
+    use_shared_auth = True
+    shared_auth_source = _resolve_shared_auth_source()
     return CodexExecutionSettings(
         home_parent=codex_home_path.parent if codex_home_path is not None else None,
         seed_from=seed_from,
@@ -449,8 +423,6 @@ async def run_codex(
         last_message_path,
         discord_channel_name,
         model_profile,
-        set(config.discovered_ollama_models),
-        config.local_codex_profile,
     )
     child_env = None
     runtime_home_env = _prepare_execution_home(execution_settings)

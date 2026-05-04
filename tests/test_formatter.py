@@ -175,10 +175,10 @@ class FormatterPreviewTest(unittest.TestCase):
                 text_limit=700,
                 latest_response=None,
                 response_preview_chars=20,
-                bound_model_profile="qwen3-8b",
+                bound_model_profile="gpt-5.2",
             )
 
-        self.assertIn("Bound model profile: `qwen3-8b`", message)
+        self.assertIn("Bound model profile: `gpt-5.2`", message)
 
 
 if __name__ == "__main__":

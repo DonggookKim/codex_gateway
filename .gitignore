@@ -1,1 +1,53 @@
-./state
+# --- Local secrets / per-install config ---------------------------
+# .env holds tokens, channel IDs, allowed users, and absolute paths.
+# Keep .env.example tracked as the template.
+.env
+.env.local
+.env.*.local
+
+# --- Python artifacts ---------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.Python
+build/
+dist/
+
+# --- Virtual environments ------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- Test / coverage artifacts -------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- Gateway runtime state -----------------------------------------
+# These directories are populated by the running gateway with
+# per-project session metadata, runtime tmp files, and last-response
+# artifacts. Each install's contents are local and should not be
+# tracked.
+state/
+runtime/
+codex_gateway_runtime/
+
+# --- Editors / IDEs ------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- AI / agent tool dirs ------------------------------------------
+.claude/
+
+# --- OS junk -------------------------------------------------------
+.DS_Store
+Thumbs.db

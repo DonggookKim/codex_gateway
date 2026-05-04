@@ -56,36 +56,18 @@ class RunnerCommandTest(unittest.TestCase):
             command,
         )
 
-    def test_build_command_uses_local_profile_for_qwen3_8b(self) -> None:
+    def test_build_command_passes_model_profile_with_dash_m(self) -> None:
         command = build_command(
             codex_bin="codex",
             session_ref="session-123",
             prompt="hello",
             last_message_path=Path("/tmp/last.txt"),
-            model_profile="qwen3-8b",
+            model_profile="gpt-5.4",
         )
 
-        self.assertIn("-p", command)
-        self.assertIn("ollama-qwen25-coder", command)
         self.assertIn("-m", command)
-        self.assertIn("qwen3:8b", command)
-        self.assertLess(command.index("-p"), command.index("resume"))
-
-    def test_build_command_uses_local_profile_for_discovered_ollama_model(self) -> None:
-        command = build_command(
-            codex_bin="codex",
-            session_ref="session-123",
-            prompt="hello",
-            last_message_path=Path("/tmp/last.txt"),
-            model_profile="llama3.1:latest",
-            local_model_profiles={"qwen3:8b", "llama3.1:latest"},
-        )
-
-        self.assertIn("-p", command)
-        self.assertIn("ollama-qwen25-coder", command)
-        self.assertIn("-m", command)
-        self.assertIn("llama3.1:latest", command)
-        self.assertLess(command.index("-p"), command.index("resume"))
+        self.assertIn("gpt-5.4", command)
+        self.assertNotIn("-p", command)
 
     def test_prepare_runtime_home_preserves_existing_codex_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -99,7 +81,7 @@ class RunnerCommandTest(unittest.TestCase):
             seed_root = root / "seed-home"
             seed_codex_dir = seed_root / ".codex"
             seed_codex_dir.mkdir(parents=True, exist_ok=True)
-            (seed_codex_dir / "config.toml").write_text("model = 'qwen'\n", encoding="utf-8")
+            (seed_codex_dir / "config.toml").write_text("model = 'gpt-5.2'\n", encoding="utf-8")
 
             config = GatewayConfig(
                 discord_gateway_token="token",
@@ -171,33 +153,6 @@ class RunnerCommandTest(unittest.TestCase):
             self.assertTrue(target_auth.is_symlink())
             self.assertEqual(target_auth.resolve(), shared_auth.resolve())
             self.assertEqual(target_auth.read_text(encoding="utf-8"), '{"fresh":true}\n')
-
-    def test_prepare_runtime_home_removes_auth_for_local_execution_env(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            home_parent = root / "runtime-home"
-            seed_root = root / "seed-home"
-            seed_codex_dir = seed_root / ".codex"
-            seed_codex_dir.mkdir(parents=True, exist_ok=True)
-            (seed_codex_dir / "config.toml").write_text(
-                "model = 'qwen3:8b'\n",
-                encoding="utf-8",
-            )
-            (seed_codex_dir / "auth.json").write_text(
-                '{"stale":true}\n',
-                encoding="utf-8",
-            )
-
-            prepare_runtime_home_dir(
-                home_parent=home_parent,
-                seed_from=seed_codex_dir,
-                shared_auth_source=None,
-                use_shared_auth=False,
-            )
-
-            target_auth = home_parent / ".codex" / "auth.json"
-            self.assertFalse(target_auth.exists())
-
 
 class RunnerSessionRefTest(unittest.IsolatedAsyncioTestCase):
     async def test_run_codex_blocks_without_selected_session(self) -> None:

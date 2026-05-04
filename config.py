@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,7 +16,6 @@ DEFAULT_PROJECTS_FILE = DEFAULT_STATE_ROOT / "projects.json"
 DEFAULT_STATE_FILE = DEFAULT_STATE_ROOT / "gateway_state.json"
 DEFAULT_TMP_DIR = DEFAULT_RUNTIME_ROOT / "tmp"
 DEFAULT_LAST_RESPONSE_FILE = DEFAULT_TMP_DIR / "last_response.txt"
-DEFAULT_LOCAL_CODEX_PROFILE = "ollama-qwen25-coder"
 
 
 def _require_env(name: str) -> str:
@@ -83,47 +80,6 @@ def _csv_ints(raw: str) -> set[int]:
     return values
 
 
-def _parse_ollama_list_output(raw: str) -> tuple[str, ...]:
-    models: list[str] = []
-    for line in raw.splitlines():
-        cleaned = line.strip()
-        if not cleaned or cleaned.lower().startswith("name "):
-            continue
-        model = cleaned.split()[0].strip()
-        if model and model not in models:
-            models.append(model)
-    return tuple(models)
-
-
-def discover_ollama_models() -> tuple[str, ...]:
-    commands: list[list[str]] = []
-    configured_ollama_bin = os.environ.get("OLLAMA_BIN", "").strip()
-    if configured_ollama_bin:
-        commands.append([configured_ollama_bin, "list"])
-    else:
-        discovered_bin = shutil.which("ollama")
-        if discovered_bin:
-            commands.append([discovered_bin, "list"])
-        commands.append(["cmd.exe", "/c", "ollama", "list"])
-
-    for command in commands:
-        try:
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            continue
-        if result.returncode != 0:
-            continue
-        models = _parse_ollama_list_output(result.stdout)
-        if models:
-            return models
-    return ()
-
-
 @dataclass(frozen=True)
 class GatewayConfig:
     discord_gateway_token: str
@@ -148,8 +104,6 @@ class GatewayConfig:
     tmp_dir: Path = DEFAULT_TMP_DIR
     last_response_file: Path = DEFAULT_LAST_RESPONSE_FILE
     prompt_preamble: str = DEFAULT_PROMPT_PREAMBLE
-    discovered_ollama_models: tuple[str, ...] = ()
-    local_codex_profile: str = DEFAULT_LOCAL_CODEX_PROFILE
 
     @classmethod
     def from_env(cls) -> "GatewayConfig":
@@ -166,10 +120,7 @@ class GatewayConfig:
         control_channel_id = _int_env("CONTROL_CHANNEL_ID")
         allowed_user_ids = _csv_ints(_require_env("ALLOWED_USER_IDS"))
         codex_bin = os.environ.get("CODEX_BIN", "codex").strip() or "codex"
-        codex_cwd = _path_env(
-            "CODEX_CWD",
-            Path("/home/boor123/work/codex_sandbox"),
-        )
+        codex_cwd = Path(_require_env("CODEX_CWD")).expanduser()
         codex_home_parent = (
             _path_env("CODEX_HOME_PARENT", runtime_root / "codex-home")
             if os.environ.get("CODEX_HOME_PARENT")
@@ -203,11 +154,6 @@ class GatewayConfig:
             "PROMPT_PREAMBLE",
             DEFAULT_PROMPT_PREAMBLE,
         ).strip()
-        local_codex_profile = (
-            os.environ.get("LOCAL_CODEX_PROFILE", DEFAULT_LOCAL_CODEX_PROFILE).strip()
-            or DEFAULT_LOCAL_CODEX_PROFILE
-        )
-        discovered_ollama_models = discover_ollama_models()
 
         state_root.mkdir(parents=True, exist_ok=True)
         runtime_root.mkdir(parents=True, exist_ok=True)
@@ -239,6 +185,4 @@ class GatewayConfig:
             tmp_dir=tmp_dir,
             last_response_file=last_response_file,
             prompt_preamble=prompt_preamble,
-            discovered_ollama_models=discovered_ollama_models,
-            local_codex_profile=local_codex_profile,
         )

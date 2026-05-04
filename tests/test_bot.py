@@ -65,7 +65,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
                     project_channel_id=111,
                     default_model_profile=default_model_profile,
                     allowed_model_profiles=allowed_model_profiles
-                    or ["gpt-5.4", "qwen3-8b"],
+                    or ["gpt-5.4", "gpt-5.2"],
                     active_session_id=active_session_id,
                     archived=False,
                 )
@@ -85,14 +85,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
             project_id=project_id,
             label=label,
             model_profile=model_profile,
-            execution_env=(
-                "local_ollama"
-                if (
-                    model_profile == "qwen3-8b"
-                    or (":" in model_profile and not model_profile.startswith("gpt-"))
-                )
-                else "openai"
-            ),
+            execution_env="openai",
         )
         return session.session_id
 
@@ -109,10 +102,9 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.state.selection_state["selected_project_id"], "mail")
         self.assertIsNone(client.state.selection_state["selected_session_id"])
-        self.assertEqual(
-            client.state.selection_state["selected_model_profile_for_new_session"],
-            "gpt-5.4",
-        )
+        # /project_select no longer prefills a pending model profile; the
+        # per-project pending value is set by /model_select on demand.
+        self.assertIsNone(client.state.get_pending_model_profile("mail"))
         interaction.response.send_message.assert_awaited_once()
         sent_text = interaction.response.send_message.await_args.args[0]
         self.assertIn("Selected project", sent_text)
@@ -208,25 +200,8 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(loaded.execution_env, "openai")
             interaction.response.send_message.assert_awaited_once()
             sent_text = interaction.response.send_message.await_args.args[0]
-            self.assertIn("Created and selected session", sent_text)
+            self.assertIn("Created session", sent_text)
             self.assertIn("Nightly triage", sent_text)
-
-    async def test_session_new_assigns_local_execution_env_for_ollama_model(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            self._seed_project(root, allowed_model_profiles=["gpt-5.4", "llama3.1:latest"])
-            client = self._make_client(root)
-            client.state.select_project("mail")
-            client.state.select_model_profile_for_new_session("llama3.1:latest")
-            interaction = MagicMock()
-            interaction.response.send_message = AsyncMock()
-
-            await client._handle_session_new(interaction, "Local triage")
-
-            selected_session_id = client.state.selection_state["selected_session_id"]
-            self.assertIsNotNone(selected_session_id)
-            loaded = client.session_store.load_session("mail", selected_session_id)
-            self.assertEqual(loaded.execution_env, "local_ollama")
 
     async def test_model_select_updates_selected_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -237,11 +212,11 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
             interaction = MagicMock()
             interaction.response.send_message = AsyncMock()
 
-            await client._handle_model_select(interaction, "qwen3-8b")
+            await client._handle_model_select(interaction, "gpt-5.2")
 
         self.assertEqual(
-            client.state.selection_state["selected_model_profile_for_new_session"],
-            "qwen3-8b",
+            client.state.get_pending_model_profile("mail"),
+            "gpt-5.2",
         )
         interaction.response.send_message.assert_awaited_once()
 
@@ -348,7 +323,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self._seed_project(root, label="Mail")
-            session_id = self._seed_session(root, label="alerts", model_profile="qwen3-8b")
+            session_id = self._seed_session(root, label="alerts", model_profile="gpt-5.2")
             client = self._make_client(root)
             client.state.select_project("mail")
             client.state.select_session(session_id)
@@ -374,8 +349,9 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Project: `mail`", sent_text)
         self.assertIn("Session: `", sent_text)
         self.assertIn("alerts", sent_text)
-        self.assertIn("Model: `qwen3-8b`", sent_text)
-        self.assertIn("Execution env: `local_ollama`", sent_text)
+        self.assertIn("Backend: `codex`", sent_text)
+        self.assertIn("Model: `gpt-5.2`", sent_text)
+        self.assertIn("Execution env: `openai`", sent_text)
         self.assertIn("Watch: `on`", sent_text)
         self.assertIn("30s", sent_text)
         self.assertIn("019thread-explicit", sent_text)
@@ -427,28 +403,6 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
             "30.0",
         )
 
-    async def test_model_select_accepts_discovered_ollama_model(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            self._seed_project(root, allowed_model_profiles=["gpt-5.4"])
-            client = self._make_client(root)
-            client.config = GatewayConfig(
-                **{
-                    **client.config.__dict__,
-                    "discovered_ollama_models": ("qwen3:8b", "llama3.1:latest"),
-                }
-            )
-            client.state.select_project("mail")
-            interaction = MagicMock()
-            interaction.response.send_message = AsyncMock()
-
-            await client._handle_model_select(interaction, "llama3.1:latest")
-
-        self.assertEqual(
-            client.state.selection_state["selected_model_profile_for_new_session"],
-            "llama3.1:latest",
-        )
-
     async def test_project_select_turns_watch_off_when_project_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -461,7 +415,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
                         cwd=root,
                         project_channel_id=111,
                         default_model_profile="gpt-5.4",
-                        allowed_model_profiles=["gpt-5.4", "qwen3-8b"],
+                        allowed_model_profiles=["gpt-5.4", "gpt-5.2"],
                         active_session_id=None,
                         archived=False,
                     ),
@@ -471,7 +425,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
                         cwd=root,
                         project_channel_id=222,
                         default_model_profile="gpt-5.4",
-                        allowed_model_profiles=["gpt-5.4", "qwen3-8b"],
+                        allowed_model_profiles=["gpt-5.4", "gpt-5.2"],
                         active_session_id=None,
                         archived=False,
                     ),
@@ -599,7 +553,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self._seed_project(root)
-            session_id = self._seed_session(root, model_profile="qwen3-8b")
+            session_id = self._seed_session(root, model_profile="gpt-5.2")
             client = self._make_client(root)
             client.state.enable_watch(
                 "mail",
@@ -618,7 +572,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
                     last_message_path=root / "tmp" / "last.txt",
                     project_id="mail",
                     session_id=session_id,
-                    model_profile="qwen3-8b",
+                    model_profile="gpt-5.2",
                     stderr_tail="",
                 ),
                 project_id="mail",
@@ -632,7 +586,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_awaited_once()
         kwargs = channel.send.await_args.kwargs
         self.assertIn("Watch snapshot", kwargs["content"])
-        self.assertIn("Bound model profile: `qwen3-8b`", kwargs["content"])
+        self.assertIn("Bound model profile: `gpt-5.2`", kwargs["content"])
 
     async def test_persist_session_artifacts_copies_debug_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -905,7 +859,7 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self._seed_project(root)
-            session_id = self._seed_session(root, label="alerts", model_profile="qwen3-8b")
+            session_id = self._seed_session(root, label="alerts", model_profile="gpt-5.2")
             client = self._make_client(root)
 
             with patch(
@@ -934,14 +888,14 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
                     project_id="mail",
                     session_id=session_id,
                     codex_session_ref="019existingthread",
-                    model_profile="qwen3-8b",
+                    model_profile="gpt-5.2",
                     project_label="Mail",
                     session_label="alerts",
                 )
 
         self.assertEqual(
             run_codex_mock.await_args.kwargs["model_profile"],
-            "qwen3-8b",
+            "gpt-5.2",
         )
 
     async def test_safe_defer_swallows_unknown_interaction(self) -> None:

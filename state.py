@@ -124,12 +124,12 @@ class GatewayState:
         self.selection_state: dict[str, str | None] = {
             "selected_project_id": None,
             "selected_session_id": None,
-            "selected_model_profile_for_new_session": None,
             "watched_project_id": None,
             "watched_session_id": None,
             "watched_run_id": None,
             "watch_interval_seconds": None,
         }
+        self.pending_model_profile_per_project: dict[str, str] = {}
         self.mode = RunMode.IDLE
         self.active_run: ActiveRun | None = None
         self.last_run = self._load_last_run()
@@ -184,6 +184,15 @@ class GatewayState:
                 except (TypeError, ValueError):
                     continue
 
+        pending_models = payload.get("pending_model_profile_per_project")
+        if isinstance(pending_models, dict):
+            for project_id, profile in pending_models.items():
+                if profile is None:
+                    continue
+                self.pending_model_profile_per_project[str(project_id)] = str(
+                    profile
+                )
+
     def _persist_last_run(self) -> None:
         payload = {
             "last_run": self.last_run.to_json_dict() if self.last_run else None,
@@ -192,6 +201,9 @@ class GatewayState:
                 for project_id, summary in self.project_last_runs.items()
             },
             "selection_state": self.selection_state,
+            "pending_model_profile_per_project": dict(
+                self.pending_model_profile_per_project
+            ),
         }
         tmp_path = self.state_file.with_suffix(".tmp")
         tmp_path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,9 +233,19 @@ class GatewayState:
         self.selection_state["selected_session_id"] = session_id
         self._persist_last_run()
 
-    def select_model_profile_for_new_session(self, model_profile: str | None) -> None:
-        self.selection_state["selected_model_profile_for_new_session"] = model_profile
+    def set_pending_model_profile(
+        self,
+        project_id: str,
+        model_profile: str | None,
+    ) -> None:
+        if model_profile:
+            self.pending_model_profile_per_project[project_id] = model_profile
+        else:
+            self.pending_model_profile_per_project.pop(project_id, None)
         self._persist_last_run()
+
+    def get_pending_model_profile(self, project_id: str) -> str | None:
+        return self.pending_model_profile_per_project.get(project_id)
 
     def enable_watch(
         self,

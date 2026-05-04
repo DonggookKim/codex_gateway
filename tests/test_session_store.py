@@ -169,23 +169,23 @@ class SessionStoreTest(unittest.TestCase):
         self.assertEqual(loaded.session_id, session.session_id)
         self.assertEqual(loaded.codex_thread_ref, "019newthread")
 
-    def test_create_session_persists_local_execution_env(self) -> None:
+    def test_create_session_persists_explicit_execution_env(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             store = SessionStore(root, root / "runtime")
 
             session = store.create_session(
                 project_id="mail",
-                label="local-triage",
-                model_profile="llama3.1:latest",
-                execution_env="local_ollama",
+                label="explicit-env",
+                model_profile="gpt-5.2",
+                execution_env="openai",
             )
 
             loaded = SessionStore(root, root / "runtime").load_session(
                 "mail", session.session_id
             )
 
-        self.assertEqual(loaded.execution_env, "local_ollama")
+        self.assertEqual(loaded.execution_env, "openai")
 
     def test_materialize_session_codex_home_migrates_legacy_shared_codex_home(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -238,16 +238,13 @@ class SessionStoreTest(unittest.TestCase):
             state = GatewayState(state_file)
             state.select_project("mail")
             state.select_session("sess-1")
-            state.select_model_profile_for_new_session("gpt-5.4")
+            state.set_pending_model_profile("mail", "gpt-5.4")
 
             reloaded = GatewayState(state_file)
 
         self.assertEqual(reloaded.selection_state["selected_project_id"], "mail")
         self.assertEqual(reloaded.selection_state["selected_session_id"], "sess-1")
-        self.assertEqual(
-            reloaded.selection_state["selected_model_profile_for_new_session"],
-            "gpt-5.4",
-        )
+        self.assertEqual(reloaded.get_pending_model_profile("mail"), "gpt-5.4")
 
 
 if __name__ == "__main__":

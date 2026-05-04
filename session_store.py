@@ -39,6 +39,7 @@ class SessionRecord:
     created_at: str
     last_active_at: str
     archived: bool
+    backend: str = "codex"
 
     def to_json_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -60,6 +61,7 @@ class SessionRecord:
                     infer_execution_env(str(payload.get("model_profile", ""))),
                 )
             ),
+            backend=str(payload.get("backend", "codex")),
             status=str(payload.get("status", "idle")),
             codex_home_path=Path(str(payload.get("codex_home_path", ""))),
             runtime_root=Path(str(payload.get("runtime_root", ""))),
@@ -137,6 +139,7 @@ class SessionStore:
         label: str,
         model_profile: str,
         execution_env: str | None = None,
+        backend: str = "codex",
     ) -> SessionRecord:
         session_id = uuid.uuid4().hex[:8]
         record = self._build_session_record(
@@ -146,6 +149,7 @@ class SessionStore:
             model_profile=model_profile,
             execution_env=execution_env or infer_execution_env(model_profile),
             codex_thread_ref=None,
+            backend=backend,
         )
         self._write_record(record)
         return record
@@ -159,6 +163,7 @@ class SessionStore:
         model_profile: str,
         execution_env: str | None = None,
         codex_thread_ref: str | None = None,
+        backend: str = "codex",
     ) -> SessionRecord:
         record = self._build_session_record(
             project_id=project_id,
@@ -167,6 +172,7 @@ class SessionStore:
             model_profile=model_profile,
             execution_env=execution_env or infer_execution_env(model_profile),
             codex_thread_ref=codex_thread_ref,
+            backend=backend,
         )
         self._write_record(record)
         return record
@@ -242,6 +248,7 @@ class SessionStore:
             created_at=record.created_at,
             last_active_at=utc_now(),
             archived=record.archived,
+            backend=record.backend,
         )
         self._write_record(blocked_record)
         return blocked_record
@@ -306,6 +313,7 @@ class SessionStore:
         model_profile: str,
         execution_env: str,
         codex_thread_ref: str | None,
+        backend: str = "codex",
     ) -> SessionRecord:
         session_root = self._session_root(project_id, session_id)
         codex_home_path = session_root / "codex-home" / ".codex"
@@ -339,6 +347,7 @@ class SessionStore:
             created_at=utc_now(),
             last_active_at=utc_now(),
             archived=False,
+            backend=backend,
         )
 
     def _write_record(self, record: SessionRecord) -> None:

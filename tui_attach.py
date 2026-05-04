@@ -7,7 +7,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .execution_env import LOCAL_OLLAMA_ENV
 from .project_registry import ProjectRegistry
 from .runner import prepare_runtime_home_dir
 from .session_store import SessionRecord, SessionStore
@@ -173,20 +172,15 @@ def build_resume_argv(target: AttachTarget) -> list[str]:
         "codex",
         "resume",
     ]
-    if target.model_profile == "qwen3-8b":
-        argv.extend(["-p", "ollama-qwen25-coder", "-m", "qwen3:8b"])
-    elif target.model_profile:
-        if ":" in target.model_profile:
-            argv.extend(["-p", "ollama-qwen25-coder", "-m", target.model_profile])
-        else:
-            argv.extend(["-m", target.model_profile])
+    if target.model_profile:
+        argv.extend(["-m", target.model_profile])
     argv.extend(
         [
-        "--include-non-interactive",
-        "--all",
-        "-C",
-        str(target.project_cwd),
-        target.thread_ref,
+            "--include-non-interactive",
+            "--all",
+            "-C",
+            str(target.project_cwd),
+            target.thread_ref,
         ]
     )
     return argv
@@ -222,7 +216,7 @@ def main() -> None:
     prepare_runtime_home_dir(
         home_parent=target.home_parent,
         seed_from=None,
-        use_shared_auth=target.execution_env != LOCAL_OLLAMA_ENV,
+        use_shared_auth=True,
     )
     child_env = dict(os.environ)
     child_env["HOME"] = str(target.home_parent)

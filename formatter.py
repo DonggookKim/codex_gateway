@@ -67,13 +67,29 @@ def format_status(
     recovery_hint: str | None = None,
     bound_model_profile: str | None = None,
     bound_execution_env: str | None = None,
+    bound_backend: str | None = None,
+    project_scope_id: str | None = None,
 ) -> str:
+    # When project_scope_id is supplied, render the status of that specific
+    # project (its active run, its last run). Otherwise fall back to the
+    # gateway-global view that's been the default since the codex era.
+    active_run = (
+        state.active_runs.get(project_scope_id)
+        if project_scope_id is not None
+        else state.active_run
+    )
+    last_run = (
+        state.project_last_runs.get(project_scope_id)
+        if project_scope_id is not None
+        else state.last_run
+    )
+
     local_activity_line = (
         "Local Codex activity: "
         + ("`active`" if external_codex_activity else "`idle`")
     )
-    if state.active_run is not None:
-        active = state.active_run
+    if active_run is not None:
+        active = active_run
         lines = [
             f"State: `{state.mode.value}`",
             local_activity_line,
@@ -84,6 +100,8 @@ def format_status(
             f"Elapsed: `{_fmt_elapsed(active.started_at)}`",
             f"Current request: {inline_excerpt(active.prompt_excerpt, text_limit)}",
         ]
+        if bound_backend:
+            lines.append(f"Backend: `{bound_backend}`")
         if bound_model_profile:
             lines.append(f"Bound model profile: `{bound_model_profile}`")
         if bound_execution_env:
@@ -104,12 +122,13 @@ def format_status(
             lines.append("Recovery hint: " + inline_excerpt(recovery_hint, text_limit))
         return limit_discord_message("\n".join(lines))
 
-    last_run = state.last_run
     if last_run is None:
         lines = [
             "State: `idle`",
             local_activity_line,
         ]
+        if bound_backend:
+            lines.append(f"Backend: `{bound_backend}`")
         if bound_model_profile:
             lines.append(f"Bound model profile: `{bound_model_profile}`")
         if bound_execution_env:
@@ -125,6 +144,8 @@ def format_status(
         f"Started: `{_fmt_time(last_run.started_at)}`",
         f"Finished: `{_fmt_time(last_run.finished_at)}`",
     ]
+    if bound_backend:
+        lines.append(f"Backend: `{bound_backend}`")
     if bound_model_profile:
         lines.append(f"Bound model profile: `{bound_model_profile}`")
     if bound_execution_env:
