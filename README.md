@@ -10,6 +10,44 @@ For the development narrative, removed features, and migration notes see
 [docs/HISTORY.md](./docs/HISTORY.md). For architecture and persisted
 state model see [docs/DESIGN.md](./docs/DESIGN.md).
 
+## Repository layout
+
+```
+codex_gateway/
+├── README.md                # this file
+├── __init__.py / __main__.py
+├── config.py                # env → GatewayConfig
+├── state.py                 # gateway-global selection, per-project pending model, runs
+├── execution_env.py
+├── runner.py                # codex backend implementation (subprocess)
+├── bot.py                   # discord client + slash command surface
+├── formatter.py             # discord-safe summaries
+├── notification_router.py   # project channel notifications
+├── permission_router.py     # opencode permission UX (buttons + slash fallback)
+├── tui_attach.py            # `/tui` CLI for codex sessions
+├── backend/                 # backend ABC + codex / opencode adapters
+│   ├── codex.py
+│   ├── opencode.py          # OpencodeClient + OpencodeBackend
+│   ├── opencode_runtime.py  # holder for server + client + backend
+│   └── opencode_server.py   # `opencode serve` lifecycle
+├── storage/                 # persistent JSON storage
+│   ├── session_store.py
+│   ├── project_registry.py
+│   └── last_response_store.py
+├── inspectors/              # read-only inspectors for live local state
+│   ├── process_inspector.py
+│   └── session_inspector.py
+├── scripts/                 # shell entry points
+│   ├── install.sh           # env check / auto-install / bin shim
+│   ├── run_gateway.sh       # main gateway launcher
+│   └── attach-gateway-session.sh   # `/tui` codex helper
+├── docs/
+│   ├── DESIGN.md
+│   ├── HISTORY.md
+│   └── opencode_discord_remote_dev_reference.md
+└── tests/                   # 152 unit tests
+```
+
 ## Channel model
 
 Two kinds of Discord channels are involved.
@@ -79,8 +117,12 @@ operator approval; the slash commands above are the typed fallback.
 1. Run the install check to see what is missing:
    ```bash
    bash codex_gateway/scripts/install.sh           # check only, prints missing pieces
-   bash codex_gateway/scripts/install.sh --install # attempt to install Python deps + codex/opencode CLIs
+   bash codex_gateway/scripts/install.sh --install # auto-install + register bin shim
    ```
+   `--install` also creates `~/.local/bin/codex-gateway → scripts/run_gateway.sh`.
+   Override the location with `BIN_DIR=...` or skip the link entirely with
+   `BIN_DIR=` (empty). If `~/.local/bin` is not on `$PATH`, the script
+   prints the line to add to your shell rc.
 2. Copy `.env.example` to `.env` (the `--install` mode does this for you)
    and fill in:
    - `DISCORD_GATEWAY_TOKEN` (or `DISCORD_TOKEN`)
@@ -93,6 +135,8 @@ operator approval; the slash commands above are the typed fallback.
    opencode backend.
 4. Run the gateway:
    ```bash
+   codex-gateway                                    # if the bin shim is installed
+   # or, equivalently, from anywhere:
    bash codex_gateway/scripts/run_gateway.sh
    ```
 

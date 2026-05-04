@@ -2,15 +2,25 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DEFAULT_GATEWAY_SEED_HOME="${SCRIPT_DIR}/gateway-home/.codex"
+# Resolve symlinks so the script works whether invoked via its real path
+# (bash codex_gateway/scripts/run_gateway.sh) or via a bin shim such as
+# ~/.local/bin/codex-gateway → scripts/run_gateway.sh.
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ $SCRIPT_PATH != /* ]] && SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_PATH}"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+PACKAGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${PACKAGE_DIR}/.." && pwd)"
+DEFAULT_GATEWAY_SEED_HOME="${PACKAGE_DIR}/gateway-home/.codex"
 DEFAULT_RUNTIME_ROOT="${RUNTIME_ROOT:-${HOME}/codex_gateway_runtime}"
 
-if [[ "${CODEX_GATEWAY_SKIP_ENV:-0}" != "1" && -f "${SCRIPT_DIR}/.env" ]]; then
+if [[ "${CODEX_GATEWAY_SKIP_ENV:-0}" != "1" && -f "${PACKAGE_DIR}/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
-  source "${SCRIPT_DIR}/.env"
+  source "${PACKAGE_DIR}/.env"
   set +a
 fi
 

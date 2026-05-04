@@ -34,19 +34,22 @@ channel; remaining commands stay control-channel only.
 
 ## High-level architecture
 
-Logical modules:
+Logical modules (paths relative to `codex_gateway/`):
 
 - `bot.py` — registers slash commands, validates context, dispatches to
   the right backend, and owns the optional `opencode_runtime` +
   `permission_router` injections.
-- `project_registry.py` — loads and saves registered projects.
-- `session_store.py` — per-project session records.
-  `SessionRecord.backend` selects the backend; `model_profile` holds the
-  bound model (codex profile or opencode `provider/model`).
-- `state.py` — gateway-global selection, per-project pending model map,
-  per-project active runs, last-run summaries.
 - `runner.py` — codex backend implementation: `run_codex` /
   `stop_active_run` and the `prepare_runtime_home_dir` helpers.
+- `state.py` — gateway-global selection, per-project pending model map,
+  per-project active runs, last-run summaries.
+- `config.py`, `execution_env.py` — env parsing.
+- `formatter.py` — Discord-safe summaries.
+- `notification_router.py` — project-channel notifications for blocked /
+  failed runs.
+- `permission_router.py` — bridges opencode `permission.asked` to
+  Discord button + slash UX, plus idle-timeout abort.
+- `tui_attach.py` — the `/tui` CLI for codex sessions.
 - `backend/__init__.py` — `Backend` ABC, `RunRequest`, `StopResult`.
 - `backend/codex.py` — `CodexBackend` adapter delegating to `runner`.
 - `backend/opencode.py` — `OpencodeClient` (REST + SSE) and
@@ -54,9 +57,20 @@ Logical modules:
 - `backend/opencode_server.py` — `opencode serve` lifecycle.
 - `backend/opencode_runtime.py` — `OpencodeRuntime` (server + client +
   backend holder), built from env vars.
-- `permission_router.py` — bridges opencode `permission.asked` to
-  Discord button + slash UX, plus idle-timeout abort.
-- `formatter.py` — Discord-safe summaries.
+- `storage/session_store.py` — per-project session records.
+  `SessionRecord.backend` selects the backend; `model_profile` holds the
+  bound model (codex profile or opencode `provider/model`).
+- `storage/project_registry.py` — loads and saves registered projects.
+- `storage/last_response_store.py` — last-assistant-response artifact
+  writer.
+- `inspectors/process_inspector.py` — scans for in-flight codex CLIs.
+- `inspectors/session_inspector.py` — parses codex rollout files for
+  the latest assistant response.
+- `scripts/run_gateway.sh` — gateway launcher (also exposed as
+  `codex-gateway` via `~/.local/bin/codex-gateway` after
+  `scripts/install.sh --install`).
+- `scripts/install.sh` — env check / auto-install / bin shim manager.
+- `scripts/attach-gateway-session.sh` — `/tui` codex-side helper.
 
 ## Execution model
 

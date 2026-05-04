@@ -2,7 +2,7 @@
 
 This file collects the dev journey, removed features, and rationale that
 used to be scattered across README/inline notes. The current spec lives
-in [README.md](./README.md). The architecture spec lives in
+in [../README.md](../README.md). The architecture spec lives in
 [DESIGN.md](./DESIGN.md).
 
 ## Origins — codex resume --last era

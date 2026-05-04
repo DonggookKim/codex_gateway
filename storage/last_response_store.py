@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .session_inspector import LatestCodexResponse
+from ..inspectors.session_inspector import LatestCodexResponse
 
 
 def write_last_response_text(target: Path, text: str) -> bool:

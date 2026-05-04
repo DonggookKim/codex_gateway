@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from .execution_env import infer_execution_env
+from ..execution_env import infer_execution_env
 
 
 def utc_now() -> str:

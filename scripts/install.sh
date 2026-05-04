@@ -3,10 +3,10 @@
 # codex_gateway install / environment check.
 #
 # Usage:
-#   bash codex_gateway/install.sh             # default: check only, print missing
-#   bash codex_gateway/install.sh --check     # explicit check mode
-#   bash codex_gateway/install.sh --install   # attempt to install missing pieces
-#   bash codex_gateway/install.sh --help
+#   bash codex_gateway/scripts/install.sh             # default: check only, print missing
+#   bash codex_gateway/scripts/install.sh --check     # explicit check mode
+#   bash codex_gateway/scripts/install.sh --install   # attempt to install missing pieces
+#   bash codex_gateway/scripts/install.sh --help
 #
 # The script is idempotent. It never modifies an existing `.env`. It will
 # install Python deps into the active python3, and offer brew/curl/npm
@@ -15,9 +15,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
-ENV_EXAMPLE="${SCRIPT_DIR}/.env.example"
-REQUIREMENTS="${SCRIPT_DIR}/requirements.txt"
+PACKAGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ENV_FILE="${PACKAGE_DIR}/.env"
+ENV_EXAMPLE="${PACKAGE_DIR}/.env.example"
+REQUIREMENTS="${PACKAGE_DIR}/requirements.txt"
+LAUNCHER="${SCRIPT_DIR}/run_gateway.sh"
+BIN_DIR="${BIN_DIR-${HOME}/.local/bin}"
+BIN_NAME="${BIN_NAME:-codex-gateway}"
 
 MODE="check"
 case "${1:-}" in
@@ -25,15 +29,20 @@ case "${1:-}" in
   --check|-c|"") MODE="check" ;;
   --help|-h)
     cat <<EOF
-Usage: bash codex_gateway/install.sh [--check | --install]
+Usage: bash codex_gateway/scripts/install.sh [--check | --install]
 
   --check    (default) Verify dependencies are present; print missing.
   --install  Attempt to install missing dependencies. Python deps are
              installed via pip into the active python3; codex / opencode
              CLIs are installed via brew (mac), curl (linux), or npm.
+             A bin shim is also linked into BIN_DIR so the gateway can be
+             launched as `codex-gateway` from anywhere.
 
 Environment:
   PYTHON     python interpreter to use (default: python3)
+  BIN_DIR    where to install the bin shim (default: \$HOME/.local/bin)
+             set BIN_DIR= (empty) to skip the bin link
+  BIN_NAME   bin command name (default: codex-gateway)
 EOF
     exit 0
     ;;
@@ -222,6 +231,62 @@ check_run_script_perms() {
   done
 }
 
+_resolve_link_target() {
+  # Print the absolute path the symlink at $1 points to.
+  local link="$1"
+  local target
+  target="$(readlink "$link")"
+  if [[ "$target" != /* ]]; then
+    target="$(cd "$(dirname "$link")" && cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+  fi
+  printf '%s' "$target"
+}
+
+_warn_path_unless_present() {
+  case ":$PATH:" in
+    *":${BIN_DIR}:"*) return ;;
+  esac
+  warn "${BIN_DIR} is not on \$PATH"
+  info "add to your shell rc: export PATH=\"${BIN_DIR}:\$PATH\""
+}
+
+check_bin_link() {
+  section "bin shim"
+  if [[ -z "${BIN_DIR}" ]]; then
+    info "BIN_DIR is empty; skipping bin link"
+    return
+  fi
+  local link="${BIN_DIR}/${BIN_NAME}"
+  if [[ -L "$link" ]]; then
+    local target
+    target="$(_resolve_link_target "$link")"
+    if [[ "$target" == "$LAUNCHER" ]]; then
+      ok "${link} → ${LAUNCHER}"
+      _warn_path_unless_present
+      return
+    fi
+    warn "${link} points elsewhere: ${target}"
+    info "remove it before re-installing: rm '${link}'"
+    return
+  fi
+  if [[ -e "$link" ]]; then
+    warn "${link} exists and is not a symlink; not touching"
+    return
+  fi
+  miss "${BIN_NAME} not registered in ${BIN_DIR}"
+  if [[ "$MODE" == "install" ]]; then
+    if mkdir -p "${BIN_DIR}" && ln -s "$LAUNCHER" "$link"; then
+      info "linked ${link} → ${LAUNCHER}"
+      _warn_path_unless_present
+    else
+      miss "failed to create symlink at ${link}"
+    fi
+  else
+    info "mkdir -p '${BIN_DIR}' && ln -s '${LAUNCHER}' '${link}'"
+    info "(set BIN_DIR='' before --install to skip the bin link)"
+  fi
+}
+
 # ---- run --------------------------------------------------------------
 
 printf 'codex_gateway install check (mode=%s, os=%s)\n' "$MODE" "$OS_KIND"
@@ -232,13 +297,18 @@ check_codex
 check_opencode
 check_env_file
 check_run_script_perms
+check_bin_link
 
 echo
 if (( MISSING == 0 )); then
   printf '%sAll required dependencies are present.%s\n' "$C_GREEN" "$C_RESET"
   echo "Next:"
   echo "  1. Edit ${ENV_FILE} (placeholder values still present? see warnings above)"
-  echo "  2. bash ${SCRIPT_DIR}/run_gateway.sh"
+  if [[ -n "${BIN_DIR}" && -L "${BIN_DIR}/${BIN_NAME}" ]]; then
+    echo "  2. ${BIN_NAME}"
+  else
+    echo "  2. bash ${LAUNCHER}"
+  fi
   exit 0
 fi
 
