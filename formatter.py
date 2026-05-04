@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from .session_inspector import LatestCodexResponse
+from .inspectors.session_inspector import LatestCodexResponse
 from .state import GatewayState, LastRunSummary, RunMode
 
 

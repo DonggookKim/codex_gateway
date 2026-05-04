@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from codex_gateway.session_store import SessionRecord, SessionStore
+from codex_gateway.storage.session_store import SessionRecord, SessionStore
 from codex_gateway.state import GatewayState
 
 

@@ -14,7 +14,7 @@ from .backend import StopResult
 from .config import GatewayConfig
 from .execution_env import OPENAI_ENV
 from .formatter import excerpt
-from .last_response_store import write_last_response_text
+from .storage.last_response_store import write_last_response_text
 from .notification_router import build_project_notification
 from .state import ActiveRun, GatewayState, LastRunSummary, utc_now
 

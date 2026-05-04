@@ -19,9 +19,9 @@ from .formatter import (
     limit_discord_message,
     response_preview,
 )
-from .last_response_store import refresh_last_response_file
-from .process_inspector import find_codex_processes
-from .project_registry import ProjectDefinition, ProjectRegistry
+from .storage.last_response_store import refresh_last_response_file
+from .inspectors.process_inspector import find_codex_processes
+from .storage.project_registry import ProjectDefinition, ProjectRegistry
 from .backend import RunRequest
 from .backend.opencode_runtime import (
     OpencodeRuntime,
@@ -29,8 +29,8 @@ from .backend.opencode_runtime import (
 )
 from .permission_router import PermissionRouter
 from .runner import run_codex, stop_active_run
-from .session_inspector import inspect_latest_codex_response
-from .session_store import SessionRecord, SessionStore
+from .inspectors.session_inspector import inspect_latest_codex_response
+from .storage.session_store import SessionRecord, SessionStore
 from .state import GatewayState
 from .tui_attach import TuiAttachError, build_attach_command, resolve_attach_target
 

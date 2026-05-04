@@ -4,8 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from codex_gateway.last_response_store import refresh_last_response_file
-from codex_gateway.session_inspector import LatestCodexResponse
+from codex_gateway.storage.last_response_store import refresh_last_response_file
+from codex_gateway.inspectors.session_inspector import LatestCodexResponse
 
 
 class LastResponseStoreTest(unittest.TestCase):

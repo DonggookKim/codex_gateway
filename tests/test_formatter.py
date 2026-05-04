@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from codex_gateway.formatter import format_run_complete, format_status
-from codex_gateway.session_inspector import LatestCodexResponse
+from codex_gateway.inspectors.session_inspector import LatestCodexResponse
 from codex_gateway.state import GatewayState, LastRunSummary
 
 

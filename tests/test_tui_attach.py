@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from codex_gateway.session_store import SessionStore
+from codex_gateway.storage.session_store import SessionStore
 from codex_gateway.tui_attach import (
     AttachTarget,
     TuiAttachError,
@@ -123,7 +123,7 @@ class TuiAttachTest(unittest.TestCase):
 
         self.assertEqual(
             command,
-            "bash /tmp/codex_sandbox/codex_gateway/attach-gateway-session.sh mail abc123",
+            "bash /tmp/codex_sandbox/codex_gateway/scripts/attach-gateway-session.sh mail abc123",
         )
 
     def test_build_resume_argv_uses_gpt_model_profile(self) -> None:

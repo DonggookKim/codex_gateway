@@ -7,8 +7,8 @@ both, and remote permission approval is supported for opencode-backed
 sessions over Discord buttons.
 
 For the development narrative, removed features, and migration notes see
-[HISTORY.md](./HISTORY.md). For architecture and persisted state model see
-[DESIGN.md](./DESIGN.md).
+[docs/HISTORY.md](./docs/HISTORY.md). For architecture and persisted
+state model see [docs/DESIGN.md](./docs/DESIGN.md).
 
 ## Channel model
 
@@ -78,8 +78,8 @@ operator approval; the slash commands above are the typed fallback.
 
 1. Run the install check to see what is missing:
    ```bash
-   bash codex_gateway/install.sh           # check only, prints missing pieces
-   bash codex_gateway/install.sh --install # attempt to install Python deps + codex/opencode CLIs
+   bash codex_gateway/scripts/install.sh           # check only, prints missing pieces
+   bash codex_gateway/scripts/install.sh --install # attempt to install Python deps + codex/opencode CLIs
    ```
 2. Copy `.env.example` to `.env` (the `--install` mode does this for you)
    and fill in:
@@ -93,7 +93,7 @@ operator approval; the slash commands above are the typed fallback.
    opencode backend.
 4. Run the gateway:
    ```bash
-   bash codex_gateway/run_gateway.sh
+   bash codex_gateway/scripts/run_gateway.sh
    ```
 
 The same process handles both backends; the split is per-session through
@@ -169,7 +169,7 @@ session root.
   idle; turns off automatically if the targeted project or session changes.
 - `/tui` returns a local terminal command for continuing the selected
   session at-desk:
-  - codex sessions → `bash codex_gateway/attach-gateway-session.sh ...`,
+  - codex sessions → `bash codex_gateway/scripts/attach-gateway-session.sh ...`,
     reusing the gateway runtime `HOME` so the TUI sees the same per-session
     `.codex` config.
   - opencode sessions →

@@ -10,9 +10,9 @@ import discord
 
 from codex_gateway.bot import GatewayClient
 from codex_gateway.config import GatewayConfig
-from codex_gateway.project_registry import ProjectDefinition, ProjectRegistry
-from codex_gateway.session_inspector import LatestCodexResponse
-from codex_gateway.session_store import SessionStore
+from codex_gateway.storage.project_registry import ProjectDefinition, ProjectRegistry
+from codex_gateway.inspectors.session_inspector import LatestCodexResponse
+from codex_gateway.storage.session_store import SessionStore
 from codex_gateway.state import ActiveRun, GatewayState, LastRunSummary
 
 

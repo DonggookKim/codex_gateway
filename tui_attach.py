@@ -7,9 +7,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .project_registry import ProjectRegistry
+from .storage.project_registry import ProjectRegistry
 from .runner import prepare_runtime_home_dir
-from .session_store import SessionRecord, SessionStore
+from .storage.session_store import SessionRecord, SessionStore
 
 
 THREAD_ID_PATTERN = re.compile(
@@ -163,7 +163,9 @@ def build_attach_command(
         raise TuiAttachError(
             "No Codex thread reference is recorded for this session yet."
         )
-    script_path = repo_root / "codex_gateway" / "attach-gateway-session.sh"
+    script_path = (
+        repo_root / "codex_gateway" / "scripts" / "attach-gateway-session.sh"
+    )
     return f"bash {script_path} {project_id} {session.session_id}"
 
 

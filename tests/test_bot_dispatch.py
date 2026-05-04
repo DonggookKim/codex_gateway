@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from codex_gateway.bot import GatewayClient
 from codex_gateway.config import GatewayConfig
-from codex_gateway.session_store import SessionStore
+from codex_gateway.storage.session_store import SessionStore
 from codex_gateway.state import GatewayState, LastRunSummary, utc_now
 
 

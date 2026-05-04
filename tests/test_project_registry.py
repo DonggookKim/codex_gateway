@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from codex_gateway.project_registry import ProjectDefinition, ProjectRegistry
+from codex_gateway.storage.project_registry import ProjectDefinition, ProjectRegistry
 
 
 class ProjectRegistryTest(unittest.TestCase):
