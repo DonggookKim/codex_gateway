@@ -441,6 +441,25 @@ class OpencodeBackend(Backend):
                 else (collector.finish_reason or "INCOMPLETE").upper()
             )
 
+        # Persist the full assistant text to the per-session last-response
+        # artifact so `/last` can attach it. The codex backend gets this for
+        # free via `codex exec -o <file>`; the opencode REST/SSE path has to
+        # do it explicitly. LastRunSummary only carries a truncated excerpt,
+        # which is not what `/last` is meant to surface.
+        if request.last_response_file is not None and collector.assistant_text.strip():
+            from ..storage.last_response_store import write_last_response_text
+
+            try:
+                write_last_response_text(
+                    request.last_response_file,
+                    collector.assistant_text,
+                )
+            except OSError:
+                LOGGER.exception(
+                    "Failed to write opencode last_response to %s",
+                    request.last_response_file,
+                )
+
         return LastRunSummary(
             run_id=target_session_id[:8],
             requester_user_id=request.requester_user_id,

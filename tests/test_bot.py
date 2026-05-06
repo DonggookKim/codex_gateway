@@ -127,6 +127,56 @@ class GatewayClientAskFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mail", sent_text)
         self.assertIn("Mail", sent_text)
 
+    async def test_model_profile_autocomplete_merges_live_ollama_tags(self) -> None:
+        # /model_select autocomplete must surface tags the user just pulled
+        # via `ollama pull`, not just the static project allowed list.
+        # Project-allowed profiles come first, then `ollama/<tag>` entries
+        # for whatever `ollama list` reports, deduped.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._seed_project(
+                root,
+                allowed_model_profiles=["qwen3:14b", "ollama/qwen3:14b"],
+            )
+            client = self._make_client(root)
+            client.state.select_project("mail")
+            client._get_local_ollama_models_cached = AsyncMock(
+                return_value=["qwen3:14b", "mistral-nemo:latest", "phi4:latest"]
+            )
+
+            choices = await client._model_profile_autocomplete(MagicMock(), "")
+
+        names = [c.name for c in choices]
+        # Project-allowed profiles preserved.
+        self.assertIn("qwen3:14b", names)
+        self.assertIn("ollama/qwen3:14b", names)
+        # Live ollama tags appear as `ollama/<tag>` entries.
+        self.assertIn("ollama/mistral-nemo:latest", names)
+        self.assertIn("ollama/phi4:latest", names)
+        # Dedupe: `ollama/qwen3:14b` was already in the project list and
+        # should not appear twice.
+        self.assertEqual(names.count("ollama/qwen3:14b"), 1)
+
+    async def test_model_profile_autocomplete_filters_by_needle(self) -> None:
+        # Filtering should happen after merging local-ollama tags, so a
+        # pulled tag that matches the typed substring is suggested.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._seed_project(
+                root,
+                allowed_model_profiles=["qwen3:14b"],
+            )
+            client = self._make_client(root)
+            client.state.select_project("mail")
+            client._get_local_ollama_models_cached = AsyncMock(
+                return_value=["qwen3:14b", "mistral-nemo:latest"]
+            )
+
+            choices = await client._model_profile_autocomplete(MagicMock(), "mistral")
+
+        names = [c.name for c in choices]
+        self.assertEqual(names, ["ollama/mistral-nemo:latest"])
+
     async def test_project_autocomplete_prefers_human_readable_label(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

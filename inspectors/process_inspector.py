@@ -28,6 +28,16 @@ def find_codex_processes(
     target = _safe_realpath(str(target_cwd))
     results: list[CodexProcessInfo] = []
 
+    # /proc/<pid>/{cwd,cmdline} only exists on Linux (and WSL). macOS / BSD
+    # have no equivalent readable filesystem, so the guard reduces to a
+    # no-op there. The guard's purpose is to detect a user driving codex
+    # from a separate terminal in the same cwd; the gateway already uses
+    # per-session codex-home dirs, so collisions remain unlikely even
+    # without it. A psutil-backed cross-platform reimplementation can land
+    # later if the precise check is wanted on macOS.
+    if not Path("/proc").is_dir():
+        return results
+
     for pid_text in os.listdir("/proc"):
         if not pid_text.isdigit():
             continue

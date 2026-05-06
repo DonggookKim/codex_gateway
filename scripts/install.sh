@@ -164,17 +164,128 @@ check_codex() {
   fi
 }
 
+check_opencode_ollama_provider() {
+  # Read-only check: never modify the user's opencode config. Detect whether
+  # the local-Ollama provider is registered, and if not, point at the
+  # template they can copy or merge. This matters because opencode does NOT
+  # auto-detect a running Ollama; it only knows providers defined in its
+  # config (or in the models.dev catalog, which excludes local Ollama).
+  local config_dir="$HOME/.config/opencode"
+  local config_json="${config_dir}/opencode.json"
+  local config_jsonc="${config_dir}/opencode.jsonc"
+  local example="${SCRIPT_DIR}/opencode.json.example"
+
+  local config=""
+  if [[ -f "$config_json" ]]; then
+    config="$config_json"
+  elif [[ -f "$config_jsonc" ]]; then
+    config="$config_jsonc"
+  fi
+
+  if [[ -z "$config" ]]; then
+    warn "no opencode config at ${config_json}"
+    info "to drive a local Ollama through opencode, create that file."
+    info "starter template (covers ollama provider only):"
+    info "  ${example}"
+    info ""
+    info "  mkdir -p '${config_dir}'"
+    info "  cp '${example}' '${config_json}'"
+    info "  # then edit the model list to match \`ollama list\`"
+    return
+  fi
+
+  local rc=0
+  local probe_out
+  probe_out=$("$PYTHON" - "$config" <<'PY'
+import json, re, sys
+path = sys.argv[1]
+src = open(path).read()
+try:
+    data = json.loads(src)
+except json.JSONDecodeError:
+    # Probably JSONC: strip line + block comments and retry. The strip is
+    # naive (URLs inside string literals can be mangled), so it only runs
+    # when strict JSON parsing has already failed.
+    stripped = re.sub(r'//[^\n]*', '', src)
+    stripped = re.sub(r'/\*.*?\*/', '', stripped, flags=re.DOTALL)
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        sys.exit(2)
+provider = data.get('provider', {}) if isinstance(data, dict) else {}
+ollama = provider.get('ollama') if isinstance(provider, dict) else None
+if not isinstance(ollama, dict):
+    sys.exit(1)
+# provider.ollama exists. Now validate each model has the catalog-style
+# fields that opencode uses to decide whether to forward `tools[]` on
+# outgoing chat-completion requests. Empirically, declaring only
+# `tool_call: true` is NOT enough; the full shape is required.
+required_per_model = ('tool_call', 'family', 'modalities', 'limit')
+models = ollama.get('models', {}) if isinstance(ollama.get('models'), dict) else {}
+if not models:
+    print('NO_MODELS')
+    sys.exit(3)
+under = []
+for name, meta in models.items():
+    if not isinstance(meta, dict):
+        under.append(name + ' (not an object)')
+        continue
+    missing = [k for k in required_per_model if k not in meta]
+    if missing:
+        under.append(f"{name} (missing: {', '.join(missing)})")
+if under:
+    for line in under:
+        print(line)
+    sys.exit(3)
+sys.exit(0)
+PY
+) || rc=$?
+
+  case "$rc" in
+    0)
+      ok "opencode config registers 'ollama' provider with catalog-style model metadata"
+      ;;
+    2)
+      warn "could not parse ${config} as JSON/JSONC"
+      info "fix the syntax, or compare against the reference template at:"
+      info "  ${example}"
+      ;;
+    3)
+      warn "${config} has 'provider.ollama' but model entries lack catalog-style metadata"
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        info "  - ${line}"
+      done <<<"$probe_out"
+      info ""
+      info "Minimum metadata (only \`tool_call: true\`) is silently insufficient — opencode"
+      info "will fail to forward the tools[] array and the model will refuse with"
+      info "\"I don't have a bash function\". Each model entry needs the catalog shape:"
+      info "  id, name, family, attachment, reasoning, tool_call, temperature,"
+      info "  release_date, last_updated, modalities, open_weights, cost, limit"
+      info ""
+      info "Reference shape:"
+      info "  ${example}"
+      info "Background: docs/local-ollama-toolcall-evaluation.md"
+      ;;
+    *)
+      warn "${config} has no 'provider.ollama' entry"
+      info "to add local Ollama without overwriting your existing providers,"
+      info "merge the 'provider.ollama' block from this template into your config:"
+      info "  ${example}"
+      info ""
+      info "  cat ${example}        # show the snippet"
+      info "  # then hand-merge it into ${config} under the \"provider\" key"
+      ;;
+  esac
+}
+
 check_opencode() {
   section "opencode (opencode backend, optional)"
   if command -v opencode >/dev/null 2>&1; then
     local oc_ver
     oc_ver=$(opencode --version 2>&1 | head -1 || true)
     ok "opencode ${oc_ver:-found} ($(command -v opencode))"
-    if [[ ! -f "$HOME/.config/opencode/opencode.json" ]] \
-       && [[ ! -f "$HOME/.config/opencode/opencode.jsonc" ]]; then
-      warn "no opencode provider config found at ~/.config/opencode/opencode.json{,c}"
-      warn "  configure at least one provider (e.g. model-connect, openai, anthropic) before enabling OPENCODE_GATEWAY_ENABLED=1"
-    fi
+    check_opencode_ollama_provider
     return
   fi
   warn "opencode CLI not found (only required if you plan to use backend=opencode)"

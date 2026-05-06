@@ -12,6 +12,7 @@ from codex_gateway.config import GatewayConfig
 from codex_gateway.runner import (
     _prepare_runtime_home,
     build_command,
+    codex_config_has_discord_mcp,
     prepare_runtime_home_dir,
     run_codex,
 )
@@ -55,6 +56,41 @@ class RunnerCommandTest(unittest.TestCase):
             'mcp_servers.discord.env.DISCORD_CHANNEL="android-mail-arranger"',
             command,
         )
+
+    def test_codex_config_has_discord_mcp_detects_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            self.assertFalse(codex_config_has_discord_mcp(home))
+            (home / "config.toml").write_text("[other]\nfoo = 1\n")
+            self.assertFalse(codex_config_has_discord_mcp(home))
+            (home / "config.toml").write_text(
+                '[mcp_servers.discord]\ntransport = "stdio"\n'
+            )
+            self.assertTrue(codex_config_has_discord_mcp(home))
+
+    def test_codex_config_has_discord_mcp_accepts_quoted_section_form(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            (home / "config.toml").write_text(
+                '["mcp_servers"."discord"]\ntransport = "stdio"\n'
+            )
+            self.assertTrue(codex_config_has_discord_mcp(home))
+
+    def test_codex_config_has_discord_mcp_returns_first_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home_a = Path(temp_dir) / "a"
+            home_b = Path(temp_dir) / "b"
+            home_a.mkdir()
+            home_b.mkdir()
+            (home_b / "config.toml").write_text(
+                '[mcp_servers.discord]\ntransport = "stdio"\n'
+            )
+            # First candidate has nothing, but second does → True.
+            self.assertTrue(codex_config_has_discord_mcp(home_a, home_b))
+            # None entries are skipped without raising.
+            self.assertTrue(codex_config_has_discord_mcp(None, home_b))
+            # Both empty.
+            self.assertFalse(codex_config_has_discord_mcp(home_a, None))
 
     def test_build_command_passes_model_profile_with_dash_m(self) -> None:
         command = build_command(

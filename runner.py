@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import shutil
 import uuid
@@ -79,6 +80,37 @@ def build_wrapped_prompt(config: GatewayConfig, user_prompt: str) -> str:
     if not config.prompt_preamble:
         return prompt
     return f"{config.prompt_preamble}\n\nUser request:\n{prompt}"
+
+
+_DISCORD_MCP_HEADER_RE = re.compile(
+    r'^\s*\[\s*"?mcp_servers"?\s*\.\s*"?discord"?\s*\]',
+    re.MULTILINE,
+)
+
+
+def codex_config_has_discord_mcp(*candidate_homes: Path | None) -> bool:
+    """True iff at least one of the provided .codex directories has a
+    `[mcp_servers.discord]` table in its config.toml.
+
+    The gateway used to inject `-c mcp_servers.discord.env.DISCORD_CHANNEL=...`
+    unconditionally, which works when the operator's codex config has
+    the discord MCP defined but otherwise produces
+    `Error loading config.toml: invalid transport in mcp_servers.discord`
+    because codex sees only the `.env.*` field with no transport sibling.
+    Probing first lets us drop the override silently for users who do
+    not run the discord MCP.
+    """
+    for path in candidate_homes:
+        if path is None:
+            continue
+        config_path = path / "config.toml" if path.is_dir() else path
+        try:
+            text = config_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _DISCORD_MCP_HEADER_RE.search(text):
+            return True
+    return False
 
 
 def build_command(
@@ -416,12 +448,26 @@ async def run_codex(
                 recovery_hint="Select a session before retrying the prompt.",
             )
             return summary
+    # Drop the Discord MCP env override when no `[mcp_servers.discord]`
+    # is defined in this codex install — without that section, codex
+    # rejects the orphan `.env.DISCORD_CHANNEL=...` field with
+    # "invalid transport in mcp_servers.discord". Probing the per-session
+    # codex-home first, then the seed source, then the host's default
+    # ~/.codex covers every materialization path.
+    effective_discord_channel = discord_channel_name
+    if effective_discord_channel and not codex_config_has_discord_mcp(
+        codex_home_path,
+        config.codex_home_seed_from,
+        config.codex_status_home,
+        Path.home() / ".codex",
+    ):
+        effective_discord_channel = None
     argv = build_command(
         config.codex_bin,
         resolved_session_ref,
         wrapped_prompt,
         last_message_path,
-        discord_channel_name,
+        effective_discord_channel,
         model_profile,
     )
     child_env = None

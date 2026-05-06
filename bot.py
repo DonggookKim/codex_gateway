@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from discord import app_commands
 from .config import GatewayConfig
 from .execution_env import infer_execution_env
 from .formatter import (
+    excerpt,
     format_status,
     inline_excerpt,
     limit_discord_message,
@@ -27,6 +29,7 @@ from .backend.opencode_runtime import (
     OpencodeRuntime,
     opencode_runtime_settings_from_env,
 )
+from .ollama_pull import OllamaPullError, ensure_pulled as ensure_ollama_model_pulled
 from .permission_router import PermissionRouter
 from .runner import run_codex, stop_active_run
 from .inspectors.session_inspector import inspect_latest_codex_response
@@ -36,6 +39,33 @@ from .tui_attach import TuiAttachError, build_attach_command, resolve_attach_tar
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _failed_summary_for_opencode(
+    *,
+    run_id: str,
+    requester_user_id: int,
+    requester_name: str,
+    prompt_excerpt: str,
+) -> "LastRunSummary":  # forward-declared; resolved at runtime via import below
+    from datetime import datetime, timezone
+
+    from .state import LastRunSummary
+
+    now = datetime.now(timezone.utc)
+    return LastRunSummary(
+        run_id=run_id,
+        requester_user_id=requester_user_id,
+        requester_name=requester_name,
+        prompt_excerpt=prompt_excerpt,
+        started_at=now,
+        finished_at=now,
+        exit_code=None,
+        exit_signal="OPENCODE_BACKEND_RAISED",
+        stdout_excerpt="",
+        stderr_excerpt="opencode backend raised; see gateway log",
+        assistant_response_excerpt="",
+    )
 
 
 class GatewayClient(discord.Client):
@@ -58,7 +88,71 @@ class GatewayClient(discord.Client):
         self.permission_router: PermissionRouter | None = None
         self.tree = app_commands.CommandTree(self)
         self._scheduled_watch_task: asyncio.Task | None = None
+        # Short-lived cache for `ollama list` so the /model_select
+        # autocomplete reflects newly-pulled tags without re-shelling out
+        # on every keystroke. (timestamp_monotonic, list_of_tags)
+        self._ollama_models_cache: tuple[float, list[str]] = (0.0, [])
+        self._ollama_models_cache_ttl_seconds: float = 10.0
         self._register_commands()
+
+    async def setup_hook(self) -> None:
+        """Eagerly start the opencode runtime so problems surface at boot.
+
+        Without this, the runtime is lazy-started inside the first
+        opencode `/ask`, which means a misconfigured `opencode serve` /
+        ollama provider only fails when the operator is already
+        mid-Discord-session. Startup-time probing keeps failure modes
+        on the gateway log instead of the user's chat history. Failures
+        are logged and swallowed: codex-only operation must still work
+        even if opencode is broken.
+        """
+        if self.opencode_runtime is None:
+            LOGGER.info("OpencodeRuntime not configured; skipping eager start")
+            return
+        try:
+            await self.opencode_runtime.start()
+        except Exception:
+            LOGGER.exception(
+                "OpencodeRuntime eager start failed — opencode-backed "
+                "sessions will fail until this is resolved. codex sessions "
+                "are unaffected."
+            )
+            return
+        url = self.opencode_runtime.server_url
+        LOGGER.info(
+            "OpencodeRuntime ready: server=%s provider=%s model=%s",
+            url,
+            self.opencode_runtime.settings.provider_id,
+            self.opencode_runtime.settings.model_id,
+        )
+
+    async def _get_local_ollama_models_cached(self) -> list[str]:
+        """Return locally-pulled Ollama tags, refreshed at most every
+        `self._ollama_models_cache_ttl_seconds`.
+
+        Used by `/model_select` autocomplete so a tag the operator just
+        ran `ollama pull` against shows up within seconds without the
+        gateway being restarted. On error (ollama down, binary missing),
+        returns the last known list — stale is better than empty when
+        the daemon is briefly unavailable.
+        """
+        import time
+
+        from .ollama_pull import OllamaPullError, list_local_models
+
+        now = time.monotonic()
+        last_at, last_list = self._ollama_models_cache
+        if now - last_at < self._ollama_models_cache_ttl_seconds:
+            return last_list
+        try:
+            fresh = await list_local_models()
+        except OllamaPullError:
+            return last_list
+        except Exception:
+            LOGGER.exception("ollama list refresh failed")
+            return last_list
+        self._ollama_models_cache = (now, fresh)
+        return fresh
 
     def _validate_control_context(self, interaction: discord.Interaction) -> str | None:
         if interaction.guild_id != self.config.control_guild_id:
@@ -262,8 +356,26 @@ class GatewayClient(discord.Client):
             return []
 
         needle = current.strip().lower()
-        choices: list[app_commands.Choice[str]] = []
+        # Suggestion order: project-allowed profiles first (operator
+        # curated), then live `ollama list` tags expressed as
+        # `ollama/<tag>`. Dedupe to avoid showing the same name twice.
+        # The ollama list reflects the actual local pulls without
+        # requiring projects.json to be edited each time a new model is
+        # downloaded.
+        suggestions: list[str] = []
+        seen: set[str] = set()
         for profile in self._allowed_model_profiles(project):
+            if profile not in seen:
+                suggestions.append(profile)
+                seen.add(profile)
+        for tag in await self._get_local_ollama_models_cached():
+            opencode_form = f"ollama/{tag}"
+            if opencode_form not in seen:
+                suggestions.append(opencode_form)
+                seen.add(opencode_form)
+
+        choices: list[app_commands.Choice[str]] = []
+        for profile in suggestions:
             if needle and needle not in profile.lower():
                 continue
             choices.append(app_commands.Choice(name=profile, value=profile))
@@ -480,14 +592,14 @@ class GatewayClient(discord.Client):
 
         @self.tree.command(
             name="tui",
-            description="Show the local command to attach a TUI to the selected session.",
+            description="Show the local command to attach a TUI to the channel's session (or selected one in control).",
         )
         async def tui(interaction: discord.Interaction) -> None:
-            denial = self._validate_control_context(interaction)
+            denial, channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
-            await self._handle_tui(interaction)
+            await self._handle_tui(interaction, channel_project=channel_project)
 
         @self.tree.command(
             name="watch",
@@ -507,21 +619,25 @@ class GatewayClient(discord.Client):
 
         @self.tree.command(
             name="last",
-            description="Attach the latest full Codex response as a text file.",
+            description="Attach the latest full response for the channel's session (or selected one in control).",
         )
         async def last(interaction: discord.Interaction) -> None:
-            denial = self._validate_control_context(interaction)
+            denial, channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
-            await self._handle_last(interaction)
+            await self._handle_last(interaction, channel_project=channel_project)
 
         @self.tree.command(
             name="stop",
-            description="Attempt to stop the active gateway-managed Codex run.",
+            description="Attempt to stop the active gateway-managed run (single global run; any project channel works).",
         )
         async def stop(interaction: discord.Interaction) -> None:
-            denial = self._validate_control_context(interaction)
+            # Channel-aware only at the gating layer: the gateway tracks one
+            # active run at a time globally, so /stop in a project channel
+            # stops that same global run; we do not filter by channel-project
+            # session here.
+            denial, _channel_project = self._validate_command_context(interaction)
             if denial:
                 await interaction.response.send_message(denial, ephemeral=True)
                 return
@@ -1011,15 +1127,30 @@ class GatewayClient(discord.Client):
             )
             return
 
-        # /model_select is now scoped to opencode session creation per
-        # project. Accept either a project-allowed codex profile (legacy
-        # compat, harmless because codex sessions ignore the pending value)
-        # or a free-form provider/model string for opencode.
+        # /model_select stores a pending model that only opencode session
+        # creation reads (codex ignores it). Three input shapes are
+        # accepted:
+        #   1. opencode `provider/model` string (free-form pass).
+        #   2. bare tag (e.g. `mistral-nemo:latest`) when OPENCODE_PROVIDER_ID
+        #      is configured — auto-prefixed to `{provider}/{tag}`. This
+        #      includes bare tags that happen to appear in
+        #      `allowed_model_profiles` (the rewrite is always safe because
+        #      the only consumer of the pending value is opencode, and
+        #      opencode needs the `provider/` prefix to honor the choice
+        #      instead of falling back to the env default model).
+        #   3. project-allowed codex profile when no opencode runtime is
+        #      configured (legacy compat).
         allowed_model_profiles = self._allowed_model_profiles(project)
         looks_like_opencode = "/" in cleaned_model_profile
+        in_allowed = cleaned_model_profile in allowed_model_profiles
+        if not looks_like_opencode and self.opencode_runtime is not None:
+            default_provider = self.opencode_runtime.settings.provider_id.strip()
+            if default_provider:
+                cleaned_model_profile = f"{default_provider}/{cleaned_model_profile}"
+                looks_like_opencode = True
         if (
             allowed_model_profiles
-            and cleaned_model_profile not in allowed_model_profiles
+            and not in_allowed
             and not looks_like_opencode
         ):
             allowed = ", ".join(
@@ -1030,11 +1161,45 @@ class GatewayClient(discord.Client):
                     f"Model `{cleaned_model_profile}` is not allowed for "
                     f"`{target_project_id}` and does not look like an "
                     f"opencode `provider/model` string. Allowed codex profiles: "
-                    f"{allowed}"
+                    f"{allowed}.\nTip: enable opencode runtime "
+                    f"(OPENCODE_PROVIDER_ID/OPENCODE_MODEL_ID) and the gateway "
+                    f"will auto-prefix bare ollama tags."
                 ),
                 ephemeral=True,
             )
             return
+
+        # If the user picked an opencode `provider/model` and the provider is
+        # `ollama`, transparently pull the tag when it is not already local.
+        # Other providers (model-connect, openai, …) are hosted; nothing to
+        # pull. Pull progress is streamed via interaction followup so the
+        # operator sees it instead of staring at a hung "thinking" spinner.
+        ollama_pull_handled = False
+        if looks_like_opencode:
+            provider_part, _, model_part = cleaned_model_profile.partition("/")
+            if provider_part.strip() == "ollama" and model_part.strip():
+                ollama_pull_handled = True
+                if not await self._safe_defer(interaction):
+                    return
+                async def _push(msg: str) -> None:
+                    await self._safe_followup_send(
+                        interaction,
+                        limit_discord_message(msg),
+                    )
+                try:
+                    success = await ensure_ollama_model_pulled(
+                        model_part.strip(),
+                        progress_sink=_push,
+                    )
+                except OllamaPullError as exc:
+                    await _push(f"❌ `/model_select` aborted: {exc}")
+                    return
+                if not success:
+                    await _push(
+                        f"❌ `/model_select` aborted — could not pull "
+                        f"`{model_part.strip()}`. Model not selected."
+                    )
+                    return
 
         self.state.set_pending_model_profile(
             target_project_id,
@@ -1045,13 +1210,14 @@ class GatewayClient(discord.Client):
             if looks_like_opencode
             else "(applies only when /session_new is run with backend=opencode in this project)"
         )
-        await interaction.response.send_message(
-            limit_discord_message(
-                f"Selected model for new sessions in "
-                f"`{target_project_id}`: `{cleaned_model_profile}` {scope_note}"
-            ),
-            ephemeral=False,
+        confirmation = limit_discord_message(
+            f"Selected model for new sessions in "
+            f"`{target_project_id}`: `{cleaned_model_profile}` {scope_note}"
         )
+        if ollama_pull_handled:
+            await self._safe_followup_send(interaction, confirmation)
+        else:
+            await interaction.response.send_message(confirmation, ephemeral=False)
 
     async def _handle_watch(
         self,
@@ -1117,30 +1283,26 @@ class GatewayClient(discord.Client):
             ephemeral=False,
         )
 
-    async def _handle_tui(self, interaction: discord.Interaction) -> None:
-        selected_project_id = (
-            self.state.selection_state.get("selected_project_id") or ""
-        ).strip()
-        selected_session_id = (
-            self.state.selection_state.get("selected_session_id") or ""
-        ).strip()
-        if not selected_project_id or not selected_session_id:
-            await interaction.response.send_message(
-                "Select both a project and a session before using `/tui`.",
-                ephemeral=True,
-            )
-            return
-
-        session = self._load_session_record(selected_project_id, selected_session_id)
+    async def _handle_tui(
+        self,
+        interaction: discord.Interaction,
+        *,
+        channel_project: ProjectDefinition | None = None,
+    ) -> None:
+        session = self._resolve_active_session_for_command(channel_project)
         if session is None:
+            scope_hint = (
+                "This project channel has no active session — use /session_select first."
+                if channel_project is not None
+                else "Select both a project and a session before using `/tui`."
+            )
             await interaction.response.send_message(
-                (
-                    "Selected session is unavailable for project "
-                    f"`{selected_project_id}`: `{selected_session_id}`"
-                ),
+                scope_hint,
                 ephemeral=True,
             )
             return
+        selected_project_id = session.project_id
+        selected_session_id = session.session_id
 
         if session.backend == "opencode":
             await self._reply_opencode_tui(interaction, session)
@@ -1505,14 +1667,24 @@ class GatewayClient(discord.Client):
             ephemeral=False,
         )
 
-    async def _handle_last(self, interaction: discord.Interaction) -> None:
+    async def _handle_last(
+        self,
+        interaction: discord.Interaction,
+        *,
+        channel_project: ProjectDefinition | None = None,
+    ) -> None:
         if not await self._safe_defer(interaction):
             return
-        selected_session = self._selected_session_record()
+        selected_session = self._resolve_active_session_for_command(channel_project)
         if selected_session is None:
+            scope_hint = (
+                "this project channel has no active session — use /session_select first"
+                if channel_project is not None
+                else "select a project and session before using `/last`"
+            )
             await self._safe_followup_send(
                 interaction,
-                "Select a project and session before using `/last`.",
+                scope_hint.capitalize() + ".",
             )
             return
         selected_session = await self._materialize_session_record(selected_session)
@@ -1629,6 +1801,7 @@ class GatewayClient(discord.Client):
                 model_profile=model_profile,
                 project_label=project_label,
                 session_label=session_label,
+                last_response_path=session_record.last_response_path,
             )
 
         return await run_codex(
@@ -1675,6 +1848,7 @@ class GatewayClient(discord.Client):
         model_profile: str | None,
         project_label: str | None,
         session_label: str | None,
+        last_response_path: Path | None = None,
     ) -> LastRunSummary:
         if self.opencode_runtime is None:
             raise RuntimeError(
@@ -1703,8 +1877,49 @@ class GatewayClient(discord.Client):
             model_profile=model_profile,
             project_label=project_label,
             session_label=session_label,
+            last_response_file=last_response_path,
         )
-        return await backend.run(self.state, self.config, request)
+
+        # Mirror the codex run-state lifecycle (runner.run_codex does this
+        # internally) so /status, /current, /watch, and any consumer of
+        # state.last_run / state.project_last_runs see the opencode run
+        # instead of stale codex data. Without this the previous failed
+        # codex run remains the "last run" forever.
+        from datetime import datetime, timezone
+
+        from .state import ActiveRun
+
+        run_id = uuid.uuid4().hex[:8]
+        active_run = ActiveRun(
+            run_id=run_id,
+            requester_user_id=requester_id,
+            requester_name=requester_name,
+            prompt_excerpt=excerpt(prompt, self.config.status_text_max_chars),
+            started_at=datetime.now(timezone.utc),
+            pid=None,
+            last_message_path=last_response_path or self.config.last_response_file,
+            project_id=project_id,
+            session_id=session_id,
+            model_profile=model_profile,
+        )
+        self.state.set_active_run(active_run, project_id=project_id)
+        try:
+            summary = await backend.run(self.state, self.config, request)
+        except BaseException:
+            # Surface partial state cleanly so /status does not get stuck on
+            # "RUNNING" if the backend raised.
+            self.state.finish_run(
+                _failed_summary_for_opencode(
+                    run_id=run_id,
+                    requester_user_id=requester_id,
+                    requester_name=requester_name,
+                    prompt_excerpt=active_run.prompt_excerpt,
+                ),
+                project_id=project_id,
+            )
+            raise
+        self.state.finish_run(summary, project_id=project_id)
+        return summary
 
     def _resolve_active_session_for_command(
         self,

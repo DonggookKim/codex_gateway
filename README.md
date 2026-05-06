@@ -8,7 +8,10 @@ sessions over Discord buttons.
 
 For the development narrative, removed features, and migration notes see
 [docs/HISTORY.md](./docs/HISTORY.md). For architecture and persisted
-state model see [docs/DESIGN.md](./docs/DESIGN.md).
+state model see [docs/DESIGN.md](./docs/DESIGN.md). For the local-Ollama
+tool-calling evaluation that produced the current `mistral-nemo:latest`
+default and the model-size constraints on M2 16 GB, see
+[docs/local-ollama-toolcall-evaluation.md](./docs/local-ollama-toolcall-evaluation.md).
 
 ## Repository layout
 
@@ -60,9 +63,10 @@ Two kinds of Discord channels are involved.
   touching the gateway-global selection.
 
 Channel-aware commands: `/ask`, `/session_select`, `/session_list`,
-`/session_new`, `/model_select`, `/current`, `/status`, `/perms`,
-`/perm_allow`, `/perm_reject`. The remaining commands are
-control-channel only.
+`/session_new`, `/model_select`, `/current`, `/status`, `/last`,
+`/tui`, `/stop`, `/perms`, `/perm_allow`, `/perm_reject`. The remaining
+commands (`/project_select`, `/project_list`, `/watch`) stay
+control-only — `/watch` keeps a single global target by design.
 
 ## Slash commands
 
@@ -170,14 +174,74 @@ flagged `backend=opencode` fail at dispatch with a clear error.
 | variable | default | purpose |
 |---|---|---|
 | `OPENCODE_GATEWAY_ENABLED` | `0` | `1`/`true`/`yes` enables the runtime |
-| `OPENCODE_PROVIDER_ID` | (required) | e.g. `model-connect`, `openai`, `anthropic` |
-| `OPENCODE_MODEL_ID` | (required) | e.g. `Qwen3.5-397B-A17B-FP8` |
+| `OPENCODE_PROVIDER_ID` | (required) | e.g. `ollama`, `model-connect`, `openai`, `anthropic` |
+| `OPENCODE_MODEL_ID` | (required) | e.g. `qwen3:14b`, `Qwen3.5-397B-A17B-FP8` |
 | `OPENCODE_BIN` | `opencode` | binary path |
 | `OPENCODE_SERVER_PORT` | `14096` | listen port |
 | `OPENCODE_SERVER_HOSTNAME` | `127.0.0.1` | listen host |
 | `OPENCODE_SERVER_PASSWORD` | (none) | enables Basic auth on the server |
 | `OPENCODE_DEFAULT_AGENT` | `build` | opencode agent name |
 | `OPENCODE_IDLE_TIMEOUT_SECONDS` | `7200` | abort if no operator answers a permission ask |
+
+### Local Ollama as an opencode provider
+
+opencode does not auto-detect a running local Ollama. Its built-in
+catalog (models.dev) only lists `ollama-cloud` (the hosted Turbo
+service) and `lmstudio`; the local `:11434` daemon must be registered
+explicitly as a provider.
+
+A ready-to-use template lives at
+[`scripts/opencode.json.example`](./scripts/opencode.json.example) — it
+defines an `ollama` provider over `@ai-sdk/openai-compatible` pointing
+at `http://localhost:11434/v1`.
+
+- If `~/.config/opencode/opencode.json` does not exist:
+  ```bash
+  mkdir -p ~/.config/opencode
+  cp codex_gateway/scripts/opencode.json.example ~/.config/opencode/opencode.json
+  # then edit the model list to match `ollama list`
+  ```
+- If it already exists, **do not overwrite it**. Open the template and
+  hand-merge its `provider.ollama` block under your existing
+  `"provider"` key.
+
+> ### ⚠ Two non-obvious gotchas
+>
+> **1. Minimum model metadata is silently insufficient.** A model entry
+> with only `"tool_call": true` is **not enough** to make opencode
+> propagate the `tools[]` array on outgoing chat-completion requests.
+> opencode keys this off the *full catalog-style* shape — the
+> template carries `id`, `name`, `family`, `attachment`, `reasoning`,
+> `tool_call`, `temperature`, `release_date`, `last_updated`,
+> `modalities`, `open_weights`, `cost`, `limit` for each model, and
+> all of those fields together flip the switch. Without them the
+> agent receives no tools and the model will refuse with *"I don't
+> have a bash function"* even though Ollama's
+> `/v1/chat/completions` happily forwards `tool_calls` when called
+> directly. **Copy the template's exact field set** when adding a
+> new local model.
+>
+> **2. Gemma family is unsupported on Ollama for tool calling.**
+> Ollama itself rejects tool-calling chat completions for Gemma
+> models (`Error: registry.ollama.ai/library/gemma3:4b does not
+> support tools`). This applies to `gemma2:*`, `gemma3:*`, and
+> `gemma4:*`. If you want a tool-capable local backend, prefer
+> `mistral-nemo:latest` (recommended), `qwen2.5:14b`, or other
+> tool-trained instruct models. See
+> [docs/local-ollama-toolcall-evaluation.md](./docs/local-ollama-toolcall-evaluation.md)
+> for the full matrix and reasoning behind the recommended default.
+
+`bash codex_gateway/scripts/install.sh --check` inspects the config and
+prints the exact next step for whichever state you are in (no config /
+no `provider.ollama` / models with insufficient metadata / config
+fully registered).
+
+After registration, with the gateway environment set as
+`OPENCODE_PROVIDER_ID="ollama"` and
+`OPENCODE_MODEL_ID="mistral-nemo:latest"` (or any model from
+`ollama list` that the matrix above showed as tool-capable),
+`/session_new <label> opencode` sessions route through the local
+daemon.
 
 ### Optional: ChatGPT subscription auth for opencode
 

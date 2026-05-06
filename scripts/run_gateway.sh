@@ -26,6 +26,19 @@ fi
 
 export CODEX_SHARED_AUTH_SOURCE="${CODEX_SHARED_AUTH_SOURCE:-${HOME}/.codex/auth.json}"
 
+# python.org's macOS Python.framework ships without a CA bundle by default,
+# which makes aiohttp's TLS to discord.com fail with
+# `certificate verify failed: unable to get local issuer certificate`.
+# certifi (a transitive-or-explicit dep) provides one. Point Python's default
+# SSL context at it iff the operator has not already supplied SSL_CERT_FILE.
+# Linux/WSL distros normally have system CAs and skip this branch.
+if [[ -z "${SSL_CERT_FILE:-}" ]]; then
+  CERTIFI_PATH="$(python3 -c 'import certifi; print(certifi.where())' 2>/dev/null || true)"
+  if [[ -n "${CERTIFI_PATH}" && -f "${CERTIFI_PATH}" ]]; then
+    export SSL_CERT_FILE="${CERTIFI_PATH}"
+  fi
+fi
+
 if [[ -z "${CODEX_HOME_PARENT:-}" && -d "${DEFAULT_GATEWAY_SEED_HOME}" ]]; then
   export CODEX_HOME_PARENT="${DEFAULT_RUNTIME_ROOT}/codex-home"
   export CODEX_HOME_SEED_FROM="${DEFAULT_GATEWAY_SEED_HOME}"

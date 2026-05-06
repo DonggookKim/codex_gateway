@@ -161,21 +161,28 @@ Channel-aware commands distinguish two scopes.
 
 ### `/last`
 
-- Control only. Attaches the latest captured assistant response artifact.
+- Channel-aware. In a project channel, attaches the latest response for
+  that project's `active_session_id`; in control, the gateway-globally
+  selected session.
 
 ### `/tui`
 
-- Control only. Returns the local attach command for the selected
-  session (codex backend).
+- Channel-aware. Same scope resolution as `/last`. Returns the local
+  attach command for the resolved session (codex backend) or the
+  `opencode attach ...` command (opencode backend).
 
 ### `/watch <on|off> [interval]`
 
-- Control only. Arms a repeating status snapshot for the selected
-  session until the active run goes idle.
+- Control only. Arms a repeating status snapshot for the gateway-globally
+  selected session until the active run goes idle. By design, the
+  gateway tracks a single watch target at a time, so this command does
+  not split per project channel.
 
 ### `/stop`
 
-- Control only. Stops the current gateway-managed run.
+- Channel-aware at the gating layer. The gateway tracks one active run
+  globally, so `/stop` from any project channel stops that same run; we
+  do not filter by the channel project's session.
 
 ## Persisted state
 
