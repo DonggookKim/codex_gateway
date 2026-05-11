@@ -1,55 +1,79 @@
 # codex_gateway
 
 Discord control-plane gateway for project-scoped local sessions on
-**codex** (default) and **opencode** backends. Each session is bound to a
-project and a backend at creation time; the same gateway process drives
-both, and remote permission approval is supported for opencode-backed
-sessions over Discord buttons.
+**codex** (default) and **opencode** backends. One gateway process drives
+both; sessions are bound to a project + backend at creation time, and
+remote permission approval works over Discord buttons for opencode.
 
-For the development narrative, removed features, and migration notes see
-[docs/HISTORY.md](./docs/HISTORY.md). For architecture and persisted
-state model see [docs/DESIGN.md](./docs/DESIGN.md). For the local-Ollama
-tool-calling evaluation that produced the current `mistral-nemo:latest`
-default and the model-size constraints on M2 16 GB, see
+> 한국어: [README_kor.md](./README_kor.md)
+
+- [Quick start](#quick-start)
+- [Everyday usage](#everyday-usage)
+- [Channel model](#channel-model) · [Slash command reference](#slash-command-reference) · [Backends](#backends)
+- [Configuration](#configuration) · [Local Ollama for opencode](#local-ollama-as-an-opencode-provider)
+- [Storage layout](#storage-layout) · [Operational notes](#operational-notes) · [Repository layout](#repository-layout)
+
+For the dev narrative and migration notes see
+[docs/HISTORY.md](./docs/HISTORY.md); for architecture + persisted state
+see [docs/DESIGN.md](./docs/DESIGN.md); for the local-Ollama tool-calling
+matrix behind the `mistral-nemo:latest` default see
 [docs/local-ollama-toolcall-evaluation.md](./docs/local-ollama-toolcall-evaluation.md).
 
-## Repository layout
+## Quick start
 
+```bash
+# 1. Check what's missing (read-only) or auto-install + register bin shim
+bash codex_gateway/scripts/install.sh             # check only
+bash codex_gateway/scripts/install.sh --install   # install + create ~/.local/bin/codex-gateway
+
+# 2. Fill in .env (--install copies .env.example for you)
+$EDITOR .env
+
+# 3. Run
+codex-gateway                                     # if the bin shim is on $PATH
+# or:
+bash codex_gateway/scripts/run_gateway.sh
 ```
-codex_gateway/
-├── README.md                # this file
-├── __init__.py / __main__.py
-├── config.py                # env → GatewayConfig
-├── state.py                 # gateway-global selection, per-project pending model, runs
-├── execution_env.py
-├── runner.py                # codex backend implementation (subprocess)
-├── bot.py                   # discord client + slash command surface
-├── formatter.py             # discord-safe summaries
-├── notification_router.py   # project channel notifications
-├── permission_router.py     # opencode permission UX (buttons + slash fallback)
-├── tui_attach.py            # `/tui` CLI for codex sessions
-├── backend/                 # backend ABC + codex / opencode adapters
-│   ├── codex.py
-│   ├── opencode.py          # OpencodeClient + OpencodeBackend
-│   ├── opencode_runtime.py  # holder for server + client + backend
-│   └── opencode_server.py   # `opencode serve` lifecycle
-├── storage/                 # persistent JSON storage
-│   ├── session_store.py
-│   ├── project_registry.py
-│   └── last_response_store.py
-├── inspectors/              # read-only inspectors for live local state
-│   ├── process_inspector.py
-│   └── session_inspector.py
-├── scripts/                 # shell entry points
-│   ├── install.sh           # env check / auto-install / bin shim
-│   ├── run_gateway.sh       # main gateway launcher
-│   └── attach-gateway-session.sh   # `/tui` codex helper
-├── docs/
-│   ├── DESIGN.md
-│   ├── HISTORY.md
-│   └── opencode_discord_remote_dev_reference.md
-└── tests/                   # 152 unit tests
+
+Minimum `.env` to start a codex-only gateway:
+
+```dotenv
+DISCORD_GATEWAY_TOKEN=...           # or DISCORD_TOKEN
+CONTROL_GUILD_ID=...                # or DISCORD_GUILD_ID
+CONTROL_CHANNEL_ID=...
+ALLOWED_USER_IDS=123,456            # comma-separated Discord user IDs
+CODEX_BIN=codex
+CODEX_CWD=/path/to/repo
+STATE_ROOT=~/.codex_gateway/state
+RUNTIME_ROOT=~/.codex_gateway/runtime
+PROJECTS_FILE=~/.codex_gateway/projects.json
 ```
+
+To also enable the opencode backend, add `OPENCODE_GATEWAY_ENABLED=1`
+plus `OPENCODE_PROVIDER_ID` / `OPENCODE_MODEL_ID` — see
+[Configuration → OpenCode runtime](#opencode-runtime-opt-in).
+`BIN_DIR=` (empty) on the install script skips the bin shim; `BIN_DIR=...`
+puts it elsewhere. If `~/.local/bin` isn't on `$PATH`, the script prints
+the rc line to add.
+
+## Everyday usage
+
+Once the gateway is up and a project is registered, the typical Discord flow:
+
+| step | command | where |
+|---|---|---|
+| pick a project (global) | `/project_select <project_id>` | control channel |
+| start a session | `/session_new <label> [codex\|opencode]` | control or project channel |
+| (opencode only) pick a model first | `/model_select <provider/model>` | control or project channel |
+| run a prompt | `/ask <prompt>` | control or project channel |
+| see what's happening | `/status`, `/current`, `/last` | same channel |
+| watch a long run | `/watch on [interval]` | control channel |
+| approve a permission ask (opencode) | tap ✅ / ♾️ / ❌ button, or `/perm_allow` / `/perm_reject` | project channel |
+| attach a local TUI | `/tui` → run the printed command | same channel |
+| stop | `/stop` | same channel |
+
+The full command list and channel-binding rules are in
+[Slash command reference](#slash-command-reference).
 
 ## Channel model
 
@@ -68,7 +92,7 @@ Channel-aware commands: `/ask`, `/session_select`, `/session_list`,
 commands (`/project_select`, `/project_list`, `/watch`) stay
 control-only — `/watch` keeps a single global target by design.
 
-## Slash commands
+## Slash command reference
 
 Project / session selection:
 
@@ -116,35 +140,7 @@ operator approval; the slash commands above are the typed fallback.
   `model-connect/Qwen3.5-...`). Defaults come from `OPENCODE_PROVIDER_ID` /
   `OPENCODE_MODEL_ID`; `/model_select` overrides per project.
 
-## Quick start
-
-1. Run the install check to see what is missing:
-   ```bash
-   bash codex_gateway/scripts/install.sh           # check only, prints missing pieces
-   bash codex_gateway/scripts/install.sh --install # auto-install + register bin shim
-   ```
-   `--install` also creates `~/.local/bin/codex-gateway → scripts/run_gateway.sh`.
-   Override the location with `BIN_DIR=...` or skip the link entirely with
-   `BIN_DIR=` (empty). If `~/.local/bin` is not on `$PATH`, the script
-   prints the line to add to your shell rc.
-2. Copy `.env.example` to `.env` (the `--install` mode does this for you)
-   and fill in:
-   - `DISCORD_GATEWAY_TOKEN` (or `DISCORD_TOKEN`)
-   - `CONTROL_GUILD_ID` (or `DISCORD_GUILD_ID`)
-   - `CONTROL_CHANNEL_ID`
-   - `ALLOWED_USER_IDS` (comma-separated Discord user IDs)
-   - storage paths (`STATE_ROOT`, `RUNTIME_ROOT`, `PROJECTS_FILE`)
-   - `CODEX_BIN`, `CODEX_CWD`
-3. (Optional) Set the `OPENCODE_*` env vars in `.env` to enable the
-   opencode backend.
-4. Run the gateway:
-   ```bash
-   codex-gateway                                    # if the bin shim is installed
-   # or, equivalently, from anywhere:
-   bash codex_gateway/scripts/run_gateway.sh
-   ```
-
-The same process handles both backends; the split is per-session through
+The same gateway process handles both; the split is per-session through
 the `backend` field, not through separate gateway processes.
 
 ## Configuration
@@ -291,3 +287,42 @@ session root.
 - When `OPENCODE_GATEWAY_ENABLED` is set, `opencode serve` is started in
   the background and stopped on gateway shutdown. If a server is already
   listening on the configured port, it is reused without spawning.
+
+## Repository layout
+
+```
+codex_gateway/
+├── README.md                # this file
+├── __init__.py / __main__.py
+├── config.py                # env → GatewayConfig
+├── state.py                 # gateway-global selection, per-project pending model, runs
+├── execution_env.py
+├── runner.py                # codex backend implementation (subprocess)
+├── bot.py                   # discord client + slash command surface
+├── formatter.py             # discord-safe summaries
+├── notification_router.py   # project channel notifications
+├── permission_router.py     # opencode permission UX (buttons + slash fallback)
+├── tui_attach.py            # `/tui` CLI for codex sessions
+├── backend/                 # backend ABC + codex / opencode adapters
+│   ├── codex.py
+│   ├── opencode.py          # OpencodeClient + OpencodeBackend
+│   ├── opencode_runtime.py  # holder for server + client + backend
+│   └── opencode_server.py   # `opencode serve` lifecycle
+├── storage/                 # persistent JSON storage
+│   ├── session_store.py
+│   ├── project_registry.py
+│   └── last_response_store.py
+├── inspectors/              # read-only inspectors for live local state
+│   ├── process_inspector.py
+│   └── session_inspector.py
+├── ollama_pull.py           # on-demand `ollama pull` driver for `/model_select`
+├── scripts/                 # shell entry points
+│   ├── install.sh           # env check / auto-install / bin shim
+│   ├── run_gateway.sh       # main gateway launcher
+│   └── attach-gateway-session.sh   # `/tui` codex helper
+├── docs/
+│   ├── DESIGN.md
+│   ├── HISTORY.md
+│   └── opencode_discord_remote_dev_reference.md
+└── tests/                   # 162 unit tests
+```
